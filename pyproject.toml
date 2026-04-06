@@ -13,5 +13,7 @@ dependencies = [
     "pandas>=3.0.2",
     "plotly>=6.6.0",
     "pyarrow>=23.0.1",
+    "requests>=2.33.1",
     "scikit-learn>=1.8.0",
+    "ucimlrepo>=0.0.7",
 ]

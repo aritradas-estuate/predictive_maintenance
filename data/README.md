@@ -61,6 +61,38 @@ Then run:
 
 ```bash
 uv sync
+uv run python scripts/get_data.py
 uv run marimo edit notebooks/maintenance_genealogy_app.py
 uv run marimo run notebooks/maintenance_genealogy_app.py
 ```
+
+## Automated Download
+
+The project includes a `uv`-run downloader that places real data in the correct
+folders automatically.
+
+### MetroPT-3
+
+Fetched from the official UCI archive into `data/raw/metropt3/`.
+
+### EV Battery QC
+
+Fetched from Kaggle into `data/raw/ev_battery_qc/`.
+
+Use environment-based authentication:
+
+```bash
+export KAGGLE_API_TOKEN=...
+uv run python scripts/get_data.py
+```
+
+Optional commands:
+
+```bash
+uv run python scripts/get_data.py --metro-only
+uv run python scripts/get_data.py --ev-only
+uv run python scripts/get_data.py --force
+```
+
+The downloader uses `KAGGLE_API_TOKEN` when present. A local `kaggle.json` file
+is not required.

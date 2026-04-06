@@ -14,3 +14,10 @@ __marimo__/
 
 # macOS
 .DS_Store
+
+# Raw datasets
+data/raw/*
+!data/raw/metropt3/
+!data/raw/ev_battery_qc/
+!data/raw/metropt3/.gitkeep
+!data/raw/ev_battery_qc/.gitkeep

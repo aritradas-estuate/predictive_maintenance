@@ -20,6 +20,7 @@ Then start the project:
 
 ```bash
 uv sync
+uv run python scripts/get_data.py
 uv run marimo edit notebooks/maintenance_genealogy_app.py
 ```
 
@@ -41,6 +42,27 @@ The app will automatically detect the first supported `.csv`, `.parquet`, or
 demo dataset so you can still review the experience immediately.
 
 See [data/README.md](data/README.md) for details.
+
+## Download Data
+
+MetroPT-3 is fetched from the official UCI source. EV Battery QC is fetched
+from Kaggle using an API token supplied via the environment.
+
+```bash
+export KAGGLE_API_TOKEN=...
+uv run python scripts/get_data.py
+```
+
+Useful flags:
+
+```bash
+uv run python scripts/get_data.py --metro-only
+uv run python scripts/get_data.py --ev-only
+uv run python scripts/get_data.py --force
+```
+
+`kaggle.json` is optional. The downloader reads `KAGGLE_API_TOKEN` directly and
+never writes credentials to disk.
 
 ## Inspiration Sources
 
