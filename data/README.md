@@ -50,6 +50,15 @@ the notebook still launches and demonstrates the intended workflow.
 
 ## Commands
 
+If you are on macOS and `lightgbm` fails to import with a missing
+`libomp.dylib`, install the OpenMP runtime first:
+
+```bash
+brew install libomp
+```
+
+Then run:
+
 ```bash
 uv sync
 uv run marimo edit notebooks/maintenance_genealogy_app.py

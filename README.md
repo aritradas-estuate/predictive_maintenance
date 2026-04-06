@@ -10,6 +10,14 @@ dashboard-style layout rather than a research-style scratchpad.
 
 ## Quick Start
 
+On macOS, `lightgbm` needs the OpenMP runtime. Install it once with:
+
+```bash
+brew install libomp
+```
+
+Then start the project:
+
 ```bash
 uv sync
 uv run marimo edit notebooks/maintenance_genealogy_app.py
