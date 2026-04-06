@@ -1,0 +1,17 @@
+[project]
+name = "predictive-maintenance-marimo"
+version = "0.1.0"
+description = "Professional marimo app for predictive maintenance and lot genealogy analysis"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "kagglehub>=1.0.0",
+    "lightgbm>=4.6.0",
+    "marimo>=0.22.4",
+    "networkx>=3.6.1",
+    "numpy>=2.4.4",
+    "pandas>=3.0.2",
+    "plotly>=6.6.0",
+    "pyarrow>=23.0.1",
+    "scikit-learn>=1.8.0",
+]
