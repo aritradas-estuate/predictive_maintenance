@@ -10,9 +10,10 @@
 #     "scikit-learn==1.8.0",
 # ]
 # ///
+
 import marimo
 
-__generated_with = "0.22.4"
+__generated_with = "0.22.5"
 app = marimo.App(width="full")
 
 
@@ -92,6 +93,36 @@ def _(
         )
 
 
+    def _downsample_for_plot(x, y, max_points=1500):
+        """Downsample arrays to max_points using LTTB-like min/max preservation."""
+        import numpy as np
+
+        n = len(y) if hasattr(y, "__len__") else len(x)
+        if n <= max_points:
+            return x, y
+        step = max(1, n // max_points)
+        # For each bucket, keep the point with max absolute value to preserve peaks
+        indices = []
+        for start in range(0, n, step):
+            end = min(start + step, n)
+            chunk = (
+                y[start:end] if hasattr(y, "__getitem__") else list(y)[start:end]
+            )
+            try:
+                local_idx = start + np.argmax(
+                    np.abs(np.array(chunk, dtype=float) - np.nanmean(chunk))
+                )
+            except (ValueError, TypeError):
+                local_idx = start
+            indices.append(local_idx)
+        indices = np.array(indices)
+        if hasattr(x, "iloc"):
+            return x.iloc[indices], y.iloc[indices] if hasattr(
+                y, "iloc"
+            ) else np.array(y)[indices]
+        return np.array(x)[indices], np.array(y)[indices]
+
+
     def find_data_file(directory):
         if not directory.exists():
             return None
@@ -138,6 +169,23 @@ def _(
         return None
 
 
+    _METRO_SENSOR_LABELS = {
+        "TP2": "Temp Probe 2",
+        "TP3": "Temp Probe 3",
+        "H1": "Humidity Sensor",
+        "DV_pressure": "Discharge Valve Pressure",
+        "Reservoirs": "Reservoir Pressure",
+        "Oil_temperature": "Oil Temperature (\u00b0C)",
+        "Motor_current": "Motor Current (A)",
+        "oil_temperature_c": "Oil Temperature (\u00b0C)",
+        "motor_current_a": "Motor Current (A)",
+        "air_pressure_bar": "Air Pressure (bar)",
+        "vibration_mm_s": "Vibration (mm/s)",
+        "power_kw": "Power (kW)",
+        "oil_level_pct": "Oil Level (%)",
+    }
+
+
     def generate_demo_metro_data():
         rng = np.random.default_rng(7)
         timestamps = pd.date_range("2026-01-01", periods=24 * 120, freq="h")
@@ -171,6 +219,7 @@ def _(
                     "oil_level_pct": 88
                     - 0.004 * np.arange(len(timestamps))
                     + rng.normal(0, 0.18, len(timestamps)),
+                    "COMP": 1.0,
                 }
             )
 
@@ -178,11 +227,11 @@ def _(
                 start = start_day * 24 + index * 8
                 end = start + 36
                 ramp = np.linspace(0, 1, end - start)
-                df.loc[start:end - 1, "vibration_mm_s"] += 1.8 * ramp
-                df.loc[start:end - 1, "motor_current_a"] += 2.4 * ramp
-                df.loc[start:end - 1, "oil_temperature_c"] += 3.6 * ramp
-                df.loc[start:end - 1, "air_pressure_bar"] -= 3.0 * ramp
-                df.loc[start:end - 1, "oil_level_pct"] -= 2.3 * ramp
+                df.loc[start : end - 1, "vibration_mm_s"] += 1.8 * ramp
+                df.loc[start : end - 1, "motor_current_a"] += 2.4 * ramp
+                df.loc[start : end - 1, "oil_temperature_c"] += 3.6 * ramp
+                df.loc[start : end - 1, "air_pressure_bar"] -= 3.0 * ramp
+                df.loc[start : end - 1, "oil_level_pct"] -= 2.3 * ramp
             frames.append(df)
 
         return pd.concat(frames, ignore_index=True)
@@ -213,7 +262,9 @@ def _(
 
         if timestamp_col is None:
             timestamp_col = "timestamp"
-            df[timestamp_col] = pd.date_range("2026-01-01", periods=len(df), freq="h")
+            df[timestamp_col] = pd.date_range(
+                "2026-01-01", periods=len(df), freq="h"
+            )
         else:
             df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
             df = df.loc[df[timestamp_col].notna()].copy()
@@ -222,16 +273,35 @@ def _(
             asset_col = "asset_id"
             df[asset_col] = "Primary Compressor"
 
+        # Exclude metadata/index columns
+        _skip = {asset_col}
+        for col in df.columns:
+            norm = _normalize_name(col)
+            if any(tag in norm for tag in ("unnamed", "index", "row_id")):
+                _skip.add(col)
+
         numeric_cols = [
             col
             for col in df.select_dtypes(include="number").columns
-            if col not in {asset_col}
+            if col not in _skip
         ]
-        if df.empty or len(numeric_cols) < 3:
+
+        # Separate continuous vs binary sensors
+        continuous_cols = [c for c in numeric_cols if df[c].nunique() > 2]
+        binary_cols = [c for c in numeric_cols if df[c].nunique() <= 2]
+
+        # Detect compressor state column
+        comp_col = None
+        for candidate in ("COMP", "comp", "Compressor_State"):
+            if candidate in df.columns:
+                comp_col = candidate
+                break
+
+        if df.empty or len(continuous_cols) < 3:
             df = generate_demo_metro_data()
             timestamp_col = "timestamp"
             asset_col = "asset_id"
-            numeric_cols = [
+            continuous_cols = [
                 "air_pressure_bar",
                 "oil_temperature_c",
                 "motor_current_a",
@@ -239,13 +309,25 @@ def _(
                 "power_kw",
                 "oil_level_pct",
             ]
+            binary_cols = ["COMP"]
+            comp_col = "COMP"
             mode = "demo"
             source = "Built-in demo telemetry"
 
         variability = (
-            df[numeric_cols].std(numeric_only=True).sort_values(ascending=False).index
+            df[continuous_cols]
+            .std(numeric_only=True)
+            .sort_values(ascending=False)
+            .index
         )
         sensor_cols = list(variability[:6])
+
+        sensor_labels = {}
+        for col in sensor_cols:
+            sensor_labels[col] = _METRO_SENSOR_LABELS.get(
+                col, col.replace("_", " ").title()
+            )
+
         df = df.sort_values([asset_col, timestamp_col]).reset_index(drop=True)
         assets = sorted(df[asset_col].astype(str).unique().tolist())
 
@@ -256,26 +338,49 @@ def _(
             "timestamp_col": timestamp_col,
             "asset_col": asset_col,
             "sensor_cols": sensor_cols,
+            "binary_cols": binary_cols,
+            "comp_col": comp_col,
+            "sensor_labels": sensor_labels,
             "assets": assets,
         }
 
 
-    def robust_risk_series(df, sensor_cols):
+    def robust_risk_series(df, sensor_cols, comp_col=None):
         working = df.copy()
+        is_running = (
+            working[comp_col].astype(float) >= 0.5
+            if comp_col and comp_col in working.columns
+            else pd.Series(True, index=working.index)
+        )
         signal_scores = []
         window = max(12, min(72, len(working) // 12 or 12))
         for col in sensor_cols:
             series = working[col].astype(float).interpolate(limit_direction="both")
-            rolling_center = series.rolling(window, min_periods=4).median()
-            rolling_std = (
-                series.rolling(window, min_periods=4).std().replace(0, np.nan)
+            # Compute baselines only on running periods
+            run_series = series.where(is_running)
+            rolling_center = (
+                run_series.rolling(window, min_periods=4).median().ffill().bfill()
             )
-            trend_score = ((series - rolling_center).abs() / rolling_std).clip(0, 6)
+            rolling_std = (
+                run_series.rolling(window, min_periods=4)
+                .std()
+                .replace(0, np.nan)
+                .ffill()
+                .bfill()
+            )
+            trend_score = ((series - rolling_center).abs() / rolling_std).clip(
+                0, 6
+            )
             delta = series.diff().abs()
             delta_center = delta.rolling(window, min_periods=4).median()
-            delta_std = delta.rolling(window, min_periods=4).std().replace(0, np.nan)
+            delta_std = (
+                delta.rolling(window, min_periods=4).std().replace(0, np.nan)
+            )
             delta_score = ((delta - delta_center).abs() / delta_std).clip(0, 6)
-            signal_scores.append((0.75 * trend_score + 0.25 * delta_score).fillna(0))
+            combined = (0.75 * trend_score + 0.25 * delta_score).fillna(0)
+            # Dampen score during idle periods
+            combined = combined.where(is_running, combined * 0.15)
+            signal_scores.append(combined)
 
         stacked = pd.concat(signal_scores, axis=1)
         raw_risk = stacked.mean(axis=1)
@@ -283,41 +388,418 @@ def _(
         return (raw_risk / scale * 100).clip(0, 100)
 
 
+    def _compute_degradation(asset_df, sensor_cols, time_col, comp_col=None):
+        n = len(asset_df)
+        smooth_window = max(12, n // 50)
+        is_running = (
+            asset_df[comp_col].astype(float) >= 0.5
+            if comp_col and comp_col in asset_df.columns
+            else pd.Series(True, index=asset_df.index)
+        )
+        results = {}
+        for col in sensor_cols:
+            series = (
+                asset_df[col].astype(float).interpolate(limit_direction="both")
+            )
+            smoothed = series.rolling(smooth_window, min_periods=4).mean().bfill()
+            # Fit trend on running periods only
+            run_mask = is_running.values
+            t = np.arange(n)
+            run_t = t[run_mask]
+            run_vals = smoothed.values[run_mask]
+            if len(run_t) < 10:
+                run_t = t
+                run_vals = smoothed.values
+            slope, intercept = np.polyfit(run_t, run_vals, 1)
+            residuals = run_vals - (slope * run_t + intercept)
+            residual_std = float(np.std(residuals)) if len(residuals) > 1 else 1.0
+            run_series = series[is_running]
+            nominal_low = float(run_series.quantile(0.05))
+            nominal_high = float(run_series.quantile(0.95))
+            current_value = float(series.iloc[-1])
+            results[col] = {
+                "slope": float(slope),
+                "intercept": float(intercept),
+                "residual_std": residual_std,
+                "nominal_low": nominal_low,
+                "nominal_high": nominal_high,
+                "nominal_center": (nominal_low + nominal_high) / 2,
+                "nominal_half_range": (nominal_high - nominal_low) / 2,
+                "current_value": current_value,
+                "trend_line": slope * t + intercept,
+                "smoothed": smoothed.values,
+            }
+        return results
+
+
+    def _estimate_rul(asset_df, risk_series, degradation, sensor_cols, time_col):
+        n = len(asset_df)
+        # Data-driven risk threshold
+        risk_threshold = max(70.0, float(risk_series.quantile(0.90)))
+
+        # Fit linear trend on last 30% of risk series
+        tail_start = max(0, int(n * 0.7))
+        tail_risk = risk_series.values[tail_start:]
+        tail_t = np.arange(len(tail_risk))
+        if len(tail_t) >= 2:
+            risk_slope, risk_intercept = np.polyfit(tail_t, tail_risk, 1)
+        else:
+            risk_slope, risk_intercept = 0.0, float(risk_series.iloc[-1])
+
+        # Extrapolate: steps until risk hits threshold
+        current_risk = float(risk_series.iloc[-1])
+        if risk_slope > 0.001:
+            steps_to_threshold = max(
+                0, (risk_threshold - current_risk) / risk_slope
+            )
+        else:
+            steps_to_threshold = float("inf")
+
+        # Estimate hours per step from timestamp spacing
+        if time_col in asset_df.columns and len(asset_df) >= 2:
+            ts = pd.to_datetime(asset_df[time_col])
+            total_hours = (ts.iloc[-1] - ts.iloc[0]).total_seconds() / 3600
+            hours_per_step = total_hours / max(1, n - 1)
+        else:
+            hours_per_step = 1.0
+
+        composite_rul_hours = (
+            min(9999, steps_to_threshold * hours_per_step)
+            if steps_to_threshold != float("inf")
+            else 9999
+        )
+
+        # Per-sensor RUL: time to exit nominal band
+        per_sensor_rul = {}
+        for col in sensor_cols:
+            deg = degradation[col]
+            slope = deg["slope"]
+            current = deg["current_value"]
+            if abs(slope) < 1e-9:
+                per_sensor_rul[col] = 9999
+                continue
+            if slope > 0:
+                boundary = deg["nominal_high"]
+                steps = (
+                    max(0, (boundary - current) / slope)
+                    if current < boundary
+                    else 0
+                )
+            else:
+                boundary = deg["nominal_low"]
+                steps = (
+                    max(0, (current - boundary) / abs(slope))
+                    if current > boundary
+                    else 0
+                )
+            per_sensor_rul[col] = min(9999, steps * hours_per_step)
+
+        # Weakest link
+        min_sensor_rul = min(per_sensor_rul.values()) if per_sensor_rul else 9999
+        composite_rul_hours = min(composite_rul_hours, min_sensor_rul)
+
+        weakest_sensor = (
+            min(per_sensor_rul, key=per_sensor_rul.get) if per_sensor_rul else ""
+        )
+
+        return {
+            "composite_rul_hours": int(composite_rul_hours),
+            "per_sensor_rul": per_sensor_rul,
+            "risk_threshold": risk_threshold,
+            "risk_slope": float(risk_slope),
+            "hours_per_step": hours_per_step,
+            "weakest_sensor": weakest_sensor,
+        }
+
+
+    def _optimize_maintenance(
+        rul_hours, horizon_hours, risk_score, risk_threshold
+    ):
+        n_candidates = 48
+        candidates = np.linspace(0, horizon_hours, n_candidates)
+        steepness = 6.0 / max(1, rul_hours)
+        failure_probs = 1.0 / (1.0 + np.exp(-steepness * (candidates - rul_hours)))
+        productive_values = candidates / max(1, horizon_hours)
+        expected_benefit = productive_values - 2.0 * failure_probs
+        best_idx = int(np.argmax(expected_benefit))
+        optimal_hour = float(candidates[best_idx])
+        failure_at_optimal = float(failure_probs[best_idx])
+
+        # Data-driven urgency thresholds
+        high_threshold = risk_threshold * 0.85
+        mid_threshold = risk_threshold * 0.65
+        if risk_score >= high_threshold:
+            recommendation = "Intervene now"
+            window_lo = 0
+            window_hi = max(8, int(optimal_hour))
+        elif risk_score >= mid_threshold:
+            recommendation = "Plan next shift"
+            window_lo = max(4, int(optimal_hour * 0.5))
+            window_hi = max(18, int(optimal_hour * 1.2))
+        else:
+            recommendation = "Monitor and defer"
+            window_lo = max(12, int(optimal_hour * 0.8))
+            window_hi = max(36, int(optimal_hour * 1.5))
+        maintenance_window = f"{window_lo}-{window_hi}h"
+
+        return {
+            "optimal_hour": int(optimal_hour),
+            "failure_at_optimal": failure_at_optimal,
+            "recommendation": recommendation,
+            "maintenance_window": maintenance_window,
+            "candidates": candidates,
+            "failure_probs": failure_probs,
+            "expected_benefit": expected_benefit,
+        }
+
+
+    def _compute_usability(degradation, sensor_cols):
+        per_sensor = {}
+        weights = []
+        usabilities = []
+        for col in sensor_cols:
+            deg = degradation[col]
+            half_range = deg["nominal_half_range"]
+            if half_range < 1e-9:
+                per_sensor[col] = 100.0
+                continue
+            dist = abs(deg["current_value"] - deg["nominal_center"])
+            usability = max(0.0, (1.0 - dist / half_range)) * 100
+            per_sensor[col] = round(usability, 1)
+            usabilities.append(usability)
+            weights.append(abs(deg["slope"]))
+
+        total_weight = sum(weights)
+        if total_weight > 0 and usabilities:
+            composite = (
+                sum(u * w for u, w in zip(usabilities, weights)) / total_weight
+            )
+        elif usabilities:
+            composite = sum(usabilities) / len(usabilities)
+        else:
+            composite = 100.0
+
+        weakest = min(per_sensor, key=per_sensor.get) if per_sensor else ""
+        return {
+            "composite_pct": round(composite, 1),
+            "per_sensor": per_sensor,
+            "weakest_sensor": weakest,
+        }
+
+
+    def _build_degradation_fig(
+        asset_df, degradation, sensor_cols, time_col, sensor_labels
+    ):
+        n_sensors = min(len(sensor_cols), 4)
+        cols = sensor_cols[:n_sensors]
+        fig = make_subplots(
+            rows=n_sensors,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.06,
+            subplot_titles=[sensor_labels.get(c, c) for c in cols],
+        )
+        palette = ["#315c72", "#cf8f3d", "#8a9ca8", "#6b7280"]
+        t_vals = (
+            asset_df[time_col]
+            if time_col in asset_df.columns
+            else list(range(len(asset_df)))
+        )
+        for i, col in enumerate(cols, 1):
+            deg = degradation[col]
+            ds_t, ds_smooth = _downsample_for_plot(t_vals, deg["smoothed"])
+            fig.add_trace(
+                go.Scatter(
+                    x=ds_t,
+                    y=ds_smooth,
+                    name=sensor_labels.get(col, col),
+                    line={"width": 2, "color": palette[i - 1]},
+                    showlegend=(i == 1),
+                    legendgroup=col,
+                ),
+                row=i,
+                col=1,
+            )
+            ds_t2, ds_trend = _downsample_for_plot(t_vals, deg["trend_line"])
+            fig.add_trace(
+                go.Scatter(
+                    x=ds_t2,
+                    y=ds_trend,
+                    name="Trend",
+                    line={"width": 2, "color": palette[i - 1], "dash": "dash"},
+                    showlegend=(i == 1),
+                    legendgroup="trend",
+                ),
+                row=i,
+                col=1,
+            )
+            # Nominal range band
+            fig.add_hrect(
+                y0=deg["nominal_low"],
+                y1=deg["nominal_high"],
+                fillcolor="rgba(49, 92, 114, 0.08)",
+                line_width=0,
+                row=i,
+                col=1,
+            )
+            # Confidence band around trend
+            upper = deg["trend_line"] + deg["residual_std"]
+            lower = deg["trend_line"] - deg["residual_std"]
+            ds_t3, ds_upper = _downsample_for_plot(t_vals, upper)
+            _, ds_lower = _downsample_for_plot(t_vals, lower)
+            fig.add_trace(
+                go.Scatter(
+                    x=list(ds_t3) + list(ds_t3)[::-1],
+                    y=list(ds_upper) + list(ds_lower)[::-1],
+                    fill="toself",
+                    fillcolor=f"rgba(49, 92, 114, 0.06)",
+                    line={"width": 0},
+                    showlegend=False,
+                    hoverinfo="skip",
+                ),
+                row=i,
+                col=1,
+            )
+        fig.update_layout(
+            height=200 * n_sensors,
+            margin={"l": 20, "r": 20, "t": 40, "b": 10},
+            paper_bgcolor="#f5f7f9",
+            plot_bgcolor="#ffffff",
+            title="Sensor degradation trends with nominal bands",
+        )
+        return fig
+
+
+    def _build_schedule_fig(schedule):
+        candidates = schedule["candidates"]
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(
+            go.Scatter(
+                x=candidates,
+                y=schedule["failure_probs"] * 100,
+                name="Failure probability",
+                line={"width": 2, "color": "#b91c1c"},
+                fill="tozeroy",
+                fillcolor="rgba(185, 28, 28, 0.08)",
+            ),
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=candidates,
+                y=schedule["expected_benefit"],
+                name="Expected benefit",
+                line={"width": 2, "color": "#315c72"},
+            ),
+            secondary_y=True,
+        )
+        opt = schedule["optimal_hour"]
+        fig.add_vline(
+            x=opt,
+            line_dash="dash",
+            line_color="#cf8f3d",
+            line_width=2,
+            annotation_text=f"Optimal: {opt}h",
+            annotation_position="top right",
+        )
+        fig.update_layout(
+            height=380,
+            margin={"l": 20, "r": 20, "t": 40, "b": 10},
+            paper_bgcolor="#f5f7f9",
+            plot_bgcolor="#ffffff",
+            title="Maintenance schedule optimizer",
+            xaxis_title="Hours from now",
+        )
+        fig.update_yaxes(title_text="Failure probability (%)", secondary_y=False)
+        fig.update_yaxes(title_text="Expected benefit", secondary_y=True)
+        return fig
+
+
+    def _build_usability_fig(usability, sensor_labels):
+        per_sensor = usability["per_sensor"]
+        labels = [sensor_labels.get(c, c) for c in per_sensor]
+        values = list(per_sensor.values())
+        colors = [
+            "#315c72" if v >= 70 else "#cf8f3d" if v >= 40 else "#b91c1c"
+            for v in values
+        ]
+        fig = go.Figure(
+            go.Bar(
+                x=values,
+                y=labels,
+                orientation="h",
+                marker_color=colors,
+                text=[f"{v:.0f}%" for v in values],
+                textposition="auto",
+            )
+        )
+        fig.add_vline(
+            x=usability["composite_pct"],
+            line_dash="dash",
+            line_color="#6b7280",
+            annotation_text=f"Composite: {usability['composite_pct']:.0f}%",
+        )
+        fig.update_layout(
+            height=max(200, 50 * len(per_sensor)),
+            margin={"l": 20, "r": 20, "t": 40, "b": 10},
+            paper_bgcolor="#f5f7f9",
+            plot_bgcolor="#ffffff",
+            title="Asset usability by sensor",
+            xaxis={"range": [0, 105], "title": "Usability (%)"},
+        )
+        return fig
+
+
     def analyze_metro(metro_state, selected_asset, horizon_hours):
         df = metro_state["df"]
         asset_col = metro_state["asset_col"]
         time_col = metro_state["timestamp_col"]
         sensor_cols = metro_state["sensor_cols"]
+        comp_col = metro_state.get("comp_col")
+        sensor_labels = metro_state.get("sensor_labels", {})
 
         asset_df = (
             df.loc[df[asset_col].astype(str) == selected_asset]
             .sort_values(time_col)
             .reset_index(drop=True)
         )
-        risk = robust_risk_series(asset_df, sensor_cols)
+        risk = robust_risk_series(asset_df, sensor_cols, comp_col=comp_col)
         asset_df = asset_df.assign(risk_score=risk, health_score=100 - risk)
         latest = asset_df.iloc[-1]
-        recent_window = asset_df.tail(min(len(asset_df), 24 * 7))
-        mean_recent_risk = float(recent_window["risk_score"].mean())
-        availability_proxy = max(55.0, 100.0 - mean_recent_risk * 0.55)
-        runway_hours = int(max(8, horizon_hours * (1.35 - latest["risk_score"] / 100)))
 
-        if latest["risk_score"] >= 78:
-            recommendation = "Intervene now"
-            maintenance_window = f"0-{max(8, horizon_hours // 4)}h"
-        elif latest["risk_score"] >= 58:
-            recommendation = "Plan next shift"
-            maintenance_window = f"{max(4, horizon_hours // 6)}-{max(18, horizon_hours // 2)}h"
-        else:
-            recommendation = "Monitor and defer"
-            maintenance_window = f"{max(12, horizon_hours // 2)}-{max(36, horizon_hours)}h"
+        # Degradation analysis
+        degradation = _compute_degradation(
+            asset_df, sensor_cols, time_col, comp_col
+        )
+        rul_info = _estimate_rul(
+            asset_df, risk, degradation, sensor_cols, time_col
+        )
+        schedule = _optimize_maintenance(
+            rul_info["composite_rul_hours"],
+            horizon_hours,
+            float(latest["risk_score"]),
+            rul_info["risk_threshold"],
+        )
+        usability = _compute_usability(degradation, sensor_cols)
 
+        # Backward-compatible values
+        recommendation = schedule["recommendation"]
+        maintenance_window = schedule["maintenance_window"]
+        runway_hours = rul_info["composite_rul_hours"]
+        availability_proxy = usability["composite_pct"]
+
+        # Driver analysis using sensor labels
         latest_driver_scores = {}
         for col in sensor_cols:
-            series = asset_df[col].astype(float).interpolate(limit_direction="both")
-            baseline = series.rolling(24, min_periods=4).median().fillna(series.median())
+            series = (
+                asset_df[col].astype(float).interpolate(limit_direction="both")
+            )
+            baseline = (
+                series.rolling(24, min_periods=4).median().fillna(series.median())
+            )
             deviation = abs(series.iloc[-1] - baseline.iloc[-1])
-            latest_driver_scores[col] = float(deviation)
+            label = sensor_labels.get(col, col)
+            latest_driver_scores[label] = float(deviation)
 
         driver_df = (
             pd.DataFrame(
@@ -340,22 +822,26 @@ def _(
         )
         palette = ["#315c72", "#8a9ca8", "#cf8f3d"]
         for color, col in zip(palette, view_cols):
+            ds_x, ds_y = _downsample_for_plot(asset_df[time_col], asset_df[col])
             trend_fig.add_trace(
                 go.Scatter(
-                    x=asset_df[time_col],
-                    y=asset_df[col],
-                    name=col,
+                    x=ds_x,
+                    y=ds_y,
+                    name=sensor_labels.get(col, col),
                     line={"width": 2, "color": color},
                 ),
                 row=1,
                 col=1,
             )
 
+        ds_rx, ds_ry = _downsample_for_plot(
+            asset_df[time_col], asset_df["risk_score"]
+        )
         trend_fig.add_trace(
             go.Scatter(
-                x=asset_df[time_col],
-                y=asset_df["risk_score"],
-                name="risk_score",
+                x=ds_rx,
+                y=ds_ry,
+                name="Risk score",
                 line={"width": 3, "color": "#b45309"},
                 fill="tozeroy",
                 fillcolor="rgba(180, 83, 9, 0.12)",
@@ -364,7 +850,7 @@ def _(
             col=1,
         )
         trend_fig.add_hrect(
-            y0=70,
+            y0=rul_info["risk_threshold"],
             y1=100,
             fillcolor="rgba(185, 28, 28, 0.12)",
             line_width=0,
@@ -380,7 +866,9 @@ def _(
             title="Asset telemetry and maintenance urgency",
         )
         trend_fig.update_yaxes(title_text="Telemetry", row=1, col=1)
-        trend_fig.update_yaxes(title_text="Risk score", row=2, col=1, range=[0, 100])
+        trend_fig.update_yaxes(
+            title_text="Risk score", row=2, col=1, range=[0, 100]
+        )
 
         driver_fig = px.bar(
             driver_df,
@@ -405,11 +893,19 @@ def _(
                 {
                     "Decision": recommendation,
                     "Window": maintenance_window,
-                    "Healthy runway (h)": runway_hours,
-                    "Operational availability": round(availability_proxy, 1),
+                    "RUL (h)": runway_hours,
+                    "Usability (%)": usability["composite_pct"],
+                    "Optimal maint. (h)": schedule["optimal_hour"],
                 }
             ]
         )
+
+        # New figures
+        deg_fig = _build_degradation_fig(
+            asset_df, degradation, sensor_cols, time_col, sensor_labels
+        )
+        sched_fig = _build_schedule_fig(schedule)
+        usability_fig = _build_usability_fig(usability, sensor_labels)
 
         return {
             "asset_df": asset_df,
@@ -423,6 +919,14 @@ def _(
             "recommendation": recommendation,
             "maintenance_window": maintenance_window,
             "driver_df": driver_df,
+            "degradation": degradation,
+            "rul_info": rul_info,
+            "schedule": schedule,
+            "usability": usability,
+            "deg_fig": deg_fig,
+            "sched_fig": sched_fig,
+            "usability_fig": usability_fig,
+            "sensor_labels": sensor_labels,
         }
 
 
@@ -450,9 +954,15 @@ def _(
                 ambient = rng.normal(24.8 + temp_shift, 1.8)
                 overhang = rng.normal(1.05 + line_bias * 0.1, 0.08)
                 electrolyte = rng.normal(4.25 - supplier_bias * 0.12, 0.12)
-                resistance = rng.normal(38 + supplier_bias * 3 + line_bias * 1.5, 2.4)
-                capacity = rng.normal(2995 - supplier_bias * 45 - line_bias * 20, 35)
-                retention = rng.normal(93.5 - supplier_bias * 1.5 - line_bias * 1.2, 1.4)
+                resistance = rng.normal(
+                    38 + supplier_bias * 3 + line_bias * 1.5, 2.4
+                )
+                capacity = rng.normal(
+                    2995 - supplier_bias * 45 - line_bias * 20, 35
+                )
+                retention = rng.normal(
+                    93.5 - supplier_bias * 1.5 - line_bias * 1.2, 1.4
+                )
 
                 risk = (
                     max(0, ambient - 26) * 0.18
@@ -596,7 +1106,9 @@ def _(
                             ("imputer", SimpleImputer(strategy="most_frequent")),
                             (
                                 "encoder",
-                                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                                OneHotEncoder(
+                                    handle_unknown="ignore", sparse_output=False
+                                ),
                             ),
                         ]
                     ),
@@ -627,7 +1139,9 @@ def _(
         df["predicted_risk"] = all_probs
 
         metrics = {
-            "average_precision": float(average_precision_score(y_test, test_probs)),
+            "average_precision": float(
+                average_precision_score(y_test, test_probs)
+            ),
             "roc_auc": float(roc_auc_score(y_test, test_probs)),
         }
 
@@ -643,14 +1157,18 @@ def _(
             .sort_values("importance", ascending=False)
             .head(10)
         )
-        importance_df["feature"] = importance_df["feature"].str.replace(
-            "numeric__", "", regex=False
-        ).str.replace("categorical__encoder__", "", regex=False)
+        importance_df["feature"] = (
+            importance_df["feature"]
+            .str.replace("numeric__", "", regex=False)
+            .str.replace("categorical__encoder__", "", regex=False)
+        )
 
         return df, metrics, importance_df
 
 
-    def lineage_figure(batch_rows, supplier_col, line_col, shift_col, batch_col, grade_col):
+    def lineage_figure(
+        batch_rows, supplier_col, line_col, shift_col, batch_col, grade_col
+    ):
         if batch_rows.empty:
             return go.Figure()
 
@@ -662,7 +1180,9 @@ def _(
             graph.add_edge(row[batch_col], row[grade_col])
 
         node_layers = {
-            "supplier": sorted(batch_rows[supplier_col].astype(str).unique().tolist()),
+            "supplier": sorted(
+                batch_rows[supplier_col].astype(str).unique().tolist()
+            ),
             "line": sorted(batch_rows[line_col].astype(str).unique().tolist()),
             "shift": sorted(batch_rows[shift_col].astype(str).unique().tolist()),
             "batch": sorted(batch_rows[batch_col].astype(str).unique().tolist()),
@@ -753,21 +1273,31 @@ def _(
 
         filtered = modeled_df.copy()
         if selected_supplier != "All":
-            filtered = filtered.loc[filtered[supplier_col].astype(str) == selected_supplier]
+            filtered = filtered.loc[
+                filtered[supplier_col].astype(str) == selected_supplier
+            ]
         if selected_line != "All":
-            filtered = filtered.loc[filtered[line_col].astype(str) == selected_line]
+            filtered = filtered.loc[
+                filtered[line_col].astype(str) == selected_line
+            ]
         if selected_batch != "All":
-            filtered = filtered.loc[filtered[batch_col].astype(str) == selected_batch]
+            filtered = filtered.loc[
+                filtered[batch_col].astype(str) == selected_batch
+            ]
 
         qc_mix = (
-            filtered.groupby(grade_col).size().reset_index(name="count").sort_values(
-                "count", ascending=False
-            )
+            filtered.groupby(grade_col)
+            .size()
+            .reset_index(name="count")
+            .sort_values("count", ascending=False)
         )
         supplier_hotspots = (
             modeled_df.groupby(supplier_col)
             .agg(
-                affected_share=(grade_col, lambda values: (values != "Grade A").mean()),
+                affected_share=(
+                    grade_col,
+                    lambda values: (values != "Grade A").mean(),
+                ),
                 avg_risk=("predicted_risk", "mean"),
             )
             .reset_index()
@@ -789,7 +1319,9 @@ def _(
         focus_batch = selected_batch
         if focus_batch == "All":
             focus_batch = str(batch_summary.iloc[0][batch_col])
-        focus_rows = modeled_df.loc[modeled_df[batch_col].astype(str) == focus_batch].copy()
+        focus_rows = modeled_df.loc[
+            modeled_df[batch_col].astype(str) == focus_batch
+        ].copy()
 
         qc_fig = px.pie(
             qc_mix,
@@ -845,7 +1377,9 @@ def _(
         )
 
         lineage_fig = lineage_figure(
-            focus_rows[[supplier_col, line_col, shift_col, batch_col, grade_col]].drop_duplicates(),
+            focus_rows[
+                [supplier_col, line_col, shift_col, batch_col, grade_col]
+            ].drop_duplicates(),
             supplier_col,
             line_col,
             shift_col,
@@ -1095,15 +1629,15 @@ def _(ev_analysis, metro_analysis, mo):
                 bordered=True,
             ),
             mo.stat(
-                value=f"{metro_analysis['health_score']:.0f}",
-                label="asset health score",
-                caption=f"window {metro_analysis['maintenance_window']}",
+                value=f"{metro_analysis['rul_info']['composite_rul_hours']}h",
+                label="remaining useful life",
+                caption=f"optimal maint. at {metro_analysis['schedule']['optimal_hour']}h",
                 bordered=True,
             ),
             mo.stat(
-                value=f"{metro_analysis['availability_proxy']:.0f}%",
-                label="usable availability",
-                caption=f"runway {metro_analysis['runway_hours']}h",
+                value=f"{metro_analysis['usability']['composite_pct']:.0f}%",
+                label="asset usability",
+                caption=f"weakest: {metro_analysis['usability']['weakest_sensor']}",
                 bordered=True,
             ),
             mo.stat(
@@ -1127,13 +1661,11 @@ def _(ROOT, mo):
         f"""
         ### Kaggle inspiration used in this app
 
-        <div class="pm-linklist">
 
-        - [MetroPT-3 | Data Import & EDA Starter](https://www.kaggle.com/code/joebeachcapital/metropt-3-data-import-eda-starter): inspired the time-series framing and clean telemetry-first story.
+        - [MetroPT-3 | Data Import & EDA Starter](https://www.kaggle.com/code/joebeachcapital/metropt-3-data-import-eda-starter): inspired the time-series framing and clean telemetry-first story.s
         - [Notebook Predictive Maintenance and XAI](https://www.kaggle.com/code/chinmayadatt/notebook-predictive-maintenance-and-xai/notebook): inspired the maintenance-driver and explainability lens.
         - [EV Battery QC code gallery](https://www.kaggle.com/datasets/kanchana1990/ev-battery-qc-synthetic-defect-dataset/code): used as the live reference point for batch-level storytelling and QC drilldowns.
 
-        </div>
 
         Data placement details live in [`data/README.md`]({ROOT / "data" / "README.md"}).
         """
@@ -1143,19 +1675,22 @@ def _(ROOT, mo):
 
 
 @app.cell(hide_code=True)
-def _(ev_analysis, metro_analysis, mo):
+def _(ev_analysis, metro_analysis, mo, pd):
     executive_view = mo.vstack(
         [
             mo.md(
                 f"""
                 ### Executive overview
 
-                - **Maintenance posture:** {metro_analysis['recommendation']} for the selected asset, with an action window of **{metro_analysis['maintenance_window']}**.
-                - **Lot genealogy posture:** batch **{ev_analysis['focus_batch']}** is the current focus lot, and supplier / line patterns indicate where defect containment should tighten first.
-                - **Why this matters:** the app ties near-term machine stress to downstream quality outcomes so operations can coordinate maintenance and traceability instead of treating them as separate decisions.
+                - **Maintenance posture:** {metro_analysis["recommendation"]} for the selected asset, with an action window of **{metro_analysis["maintenance_window"]}**.
+                - **Remaining useful life:** estimated at **{metro_analysis["rul_info"]["composite_rul_hours"]}h**, limited by **{metro_analysis["rul_info"]["weakest_sensor"]}**. Optimal maintenance at **{metro_analysis["schedule"]["optimal_hour"]}h**.
+                - **Asset usability:** operating at **{metro_analysis["usability"]["composite_pct"]:.0f}%** of design envelope.
+                - **Lot genealogy posture:** batch **{ev_analysis["focus_batch"]}** is the current focus lot, and supplier / line patterns indicate where defect containment should tighten first.
                 """
             ),
-            mo.ui.table(metro_analysis["action_table"], selection=None, page_size=5),
+            mo.ui.table(
+                metro_analysis["action_table"], selection=None, page_size=5
+            ),
         ],
         gap=0.8,
     )
@@ -1165,6 +1700,55 @@ def _(ev_analysis, metro_analysis, mo):
             metro_analysis["trend_fig"],
             metro_analysis["driver_fig"],
             mo.ui.table(metro_analysis["driver_df"], selection=None, page_size=5),
+            metro_analysis["deg_fig"],
+        ],
+        gap=0.8,
+    )
+
+    schedule_view = mo.vstack(
+        [
+            mo.md(
+                f"""
+                ### Maintenance schedule optimizer
+
+                The optimizer balances **productive uptime** against **failure probability** to find the best maintenance window.
+                Current failure probability at optimal time ({metro_analysis["schedule"]["optimal_hour"]}h): **{metro_analysis["schedule"]["failure_at_optimal"]:.1%}**.
+                """
+            ),
+            metro_analysis["sched_fig"],
+            mo.ui.table(
+                metro_analysis["action_table"], selection=None, page_size=5
+            ),
+        ],
+        gap=0.8,
+    )
+
+    usability_view = mo.vstack(
+        [
+            mo.md(
+                f"""
+                ### Asset usability breakdown
+
+                Composite usability: **{metro_analysis["usability"]["composite_pct"]:.0f}%** of design envelope.
+                Sensors degrading fastest have higher weight in the composite score.
+                """
+            ),
+            metro_analysis["usability_fig"],
+            mo.ui.table(
+                pd.DataFrame(
+                    [
+                        {
+                            "Sensor": metro_analysis["sensor_labels"].get(k, k),
+                            "Usability (%)": v,
+                        }
+                        for k, v in metro_analysis["usability"][
+                            "per_sensor"
+                        ].items()
+                    ]
+                ).sort_values("Usability (%)", ascending=True),
+                selection=None,
+                page_size=10,
+            ),
         ],
         gap=0.8,
     )
@@ -1190,9 +1774,11 @@ def _(ev_analysis, metro_analysis, mo):
                 f"""
                 ### Model summary
 
-                - EV quality model average precision: **{ev_analysis['metrics']['average_precision']:.2f}**
-                - EV quality model ROC AUC: **{ev_analysis['metrics']['roc_auc']:.2f}**
-                - Metro maintenance logic uses a rolling anomaly profile to transform telemetry drift into an operational risk score and maintenance window recommendation.
+                - EV quality model average precision: **{ev_analysis["metrics"]["average_precision"]:.2f}**
+                - EV quality model ROC AUC: **{ev_analysis["metrics"]["roc_auc"]:.2f}**
+                - Metro maintenance uses **COMP-aware** anomaly scoring (idle periods dampened) with **data-driven** risk thresholds (P90={metro_analysis["rul_info"]["risk_threshold"]:.0f}).
+                - Degradation trends fitted via linear regression on running-period sensor data.
+                - RUL estimated as weakest-link across per-sensor time-to-nominal-boundary.
                 """
             ),
             ev_analysis["importance_fig"],
@@ -1204,9 +1790,10 @@ def _(ev_analysis, metro_analysis, mo):
         f"""
         ### Operational recommendations
 
-        1. Schedule the selected asset inside **{metro_analysis['maintenance_window']}** if current staffing permits; the latest maintenance urgency is **{metro_analysis['risk_score']:.0f}/100**.
-        2. Review the process settings tied to batch **{ev_analysis['focus_batch']}**, then compare them against the highest-risk supplier genealogy path.
-        3. Capture maintenance events against batch identifiers going forward so the next version can directly quantify how maintenance timing shifts downstream scrap and downgrade rates.
+        1. **Maintenance timing:** schedule maintenance at **{metro_analysis["schedule"]["optimal_hour"]}h** (window: {metro_analysis["maintenance_window"]}). Current urgency is **{metro_analysis["risk_score"]:.0f}/100**.
+        2. **Asset life:** RUL is **{metro_analysis["rul_info"]["composite_rul_hours"]}h**, limited by {metro_analysis["rul_info"]["weakest_sensor"]}. Monitor this sensor closely for accelerating degradation.
+        3. **Usability:** the compressor is at **{metro_analysis["usability"]["composite_pct"]:.0f}%** usability. Below 50% warrants expedited intervention.
+        4. Review the process settings tied to batch **{ev_analysis["focus_batch"]}**, then compare them against the highest-risk supplier genealogy path.
         """
     )
 
@@ -1214,6 +1801,8 @@ def _(ev_analysis, metro_analysis, mo):
         {
             "Executive overview": executive_view,
             "MetroPT-3 maintenance": metro_view,
+            "Maintenance schedule": schedule_view,
+            "Asset usability": usability_view,
             "Lot genealogy": genealogy_view,
             "Risk drivers": model_view,
             "Recommendations": recommendations,
