@@ -121,6 +121,37 @@ def _(
         return np.array(x)[indices], np.array(y)[indices]
 
 
+    def apply_panel_layout(
+        fig,
+        *,
+        title,
+        height,
+        top_margin=68,
+        bottom_margin=20,
+        legend_y=1.02,
+        show_legend=True,
+    ):
+        fig.update_layout(
+            height=height,
+            margin={"l": 20, "r": 20, "t": top_margin, "b": bottom_margin},
+            paper_bgcolor="#f5f7f9",
+            plot_bgcolor="#ffffff",
+            title={"text": title, "x": 0.03, "xanchor": "left"},
+        )
+        if show_legend:
+            fig.update_layout(
+                legend={
+                    "orientation": "h",
+                    "y": legend_y,
+                    "x": 0.0,
+                    "yanchor": "bottom",
+                }
+            )
+        else:
+            fig.update_layout(showlegend=False)
+        return fig
+
+
     def find_data_file(directory):
         if not directory.exists():
             return None
@@ -658,12 +689,12 @@ def _(
                 row=i,
                 col=1,
             )
-        fig.update_layout(
-            height=200 * n_sensors,
-            margin={"l": 20, "r": 20, "t": 40, "b": 10},
-            paper_bgcolor="#f5f7f9",
-            plot_bgcolor="#ffffff",
+        apply_panel_layout(
+            fig,
             title="Sensor degradation trends with nominal bands",
+            height=200 * n_sensors,
+            top_margin=68,
+            show_legend=False,
         )
         return fig
 
@@ -699,15 +730,16 @@ def _(
             line_width=2,
             annotation_text=f"Optimal: {opt}h",
             annotation_position="top right",
+            annotation_yshift=-12,
         )
-        fig.update_layout(
-            height=380,
-            margin={"l": 20, "r": 20, "t": 40, "b": 10},
-            paper_bgcolor="#f5f7f9",
-            plot_bgcolor="#ffffff",
+        apply_panel_layout(
+            fig,
             title="Maintenance schedule optimizer",
-            xaxis_title="Hours from now",
+            height=380,
+            top_margin=76,
+            legend_y=1.03,
         )
+        fig.update_layout(xaxis_title="Hours from now")
         fig.update_yaxes(title_text="Failure probability (%)", secondary_y=False)
         fig.update_yaxes(title_text="Expected benefit", secondary_y=True)
         return fig
@@ -737,14 +769,277 @@ def _(
             line_color="#6b7280",
             annotation_text=f"Composite: {usability['composite_pct']:.0f}%",
         )
-        fig.update_layout(
-            height=max(200, 50 * len(per_sensor)),
-            margin={"l": 20, "r": 20, "t": 40, "b": 10},
-            paper_bgcolor="#f5f7f9",
-            plot_bgcolor="#ffffff",
+        apply_panel_layout(
+            fig,
             title="Asset usability by sensor",
-            xaxis={"range": [0, 105], "title": "Usability (%)"},
+            height=max(200, 50 * len(per_sensor)),
+            top_margin=68,
+            show_legend=False,
         )
+        fig.update_layout(xaxis={"range": [0, 105], "title": "Usability (%)"})
+        return fig
+
+
+    def _compute_warning_profile(current_risk, rul_info, schedule):
+        risk_threshold = float(rul_info["risk_threshold"])
+        warning_threshold = risk_threshold * 0.65
+        critical_threshold = risk_threshold * 0.85
+        slope = max(float(rul_info["risk_slope"]), 0.0)
+        hours_per_step = max(float(rul_info["hours_per_step"]), 1e-6)
+
+        def _hours_to(target):
+            if current_risk >= target:
+                return 0.0
+            if slope <= 1e-6:
+                return float(rul_info["composite_rul_hours"])
+            return max(0.0, (target - current_risk) / slope * hours_per_step)
+
+        warning_horizon = min(
+            float(rul_info["composite_rul_hours"]), _hours_to(warning_threshold)
+        )
+        intervention_horizon = min(
+            float(rul_info["composite_rul_hours"]), _hours_to(critical_threshold)
+        )
+
+        if (
+            current_risk >= critical_threshold
+            or schedule["recommendation"] == "Intervene now"
+        ):
+            state = "Intervention required"
+        elif current_risk >= warning_threshold or warning_horizon <= 24:
+            state = "Early warning"
+        else:
+            state = "Healthy runway"
+
+        return {
+            "warning_threshold": warning_threshold,
+            "critical_threshold": critical_threshold,
+            "warning_horizon_hours": int(round(warning_horizon)),
+            "intervention_horizon_hours": int(round(intervention_horizon)),
+            "state": state,
+        }
+
+
+    def _build_warning_timeline_fig(warning_profile):
+        warning_h = max(0, warning_profile["warning_horizon_hours"])
+        intervention_h = max(
+            warning_h, warning_profile["intervention_horizon_hours"]
+        )
+        state = warning_profile["state"]
+        xmax = max(intervention_h + 12, 24)
+
+        fig = go.Figure()
+        if state == "Intervention required":
+            fig.add_trace(
+                go.Bar(
+                    y=["Runway"],
+                    x=[max(1, intervention_h or 1)],
+                    orientation="h",
+                    marker={"color": "#b91c1c"},
+                    name="Intervene",
+                    text=["Intervene now"],
+                    textposition="inside",
+                )
+            )
+        else:
+            healthy_h = max(0, min(warning_h, intervention_h))
+            warning_window = max(0, intervention_h - healthy_h)
+            if healthy_h > 0:
+                fig.add_trace(
+                    go.Bar(
+                        y=["Runway"],
+                        x=[healthy_h],
+                        orientation="h",
+                        marker={"color": "#315c72"},
+                        name="Healthy",
+                        text=[f"{healthy_h}h healthy"],
+                        textposition="inside",
+                    )
+                )
+            if warning_window > 0:
+                fig.add_trace(
+                    go.Bar(
+                        y=["Runway"],
+                        x=[warning_window],
+                        base=[healthy_h],
+                        orientation="h",
+                        marker={"color": "#cf8f3d"},
+                        name="Warning",
+                        text=[f"{warning_window}h warning"],
+                        textposition="inside",
+                    )
+                )
+            fig.add_trace(
+                go.Bar(
+                    y=["Runway"],
+                    x=[max(2, xmax - intervention_h)],
+                    base=[intervention_h],
+                    orientation="h",
+                    marker={"color": "rgba(185, 28, 28, 0.18)"},
+                    name="Intervention zone",
+                    hoverinfo="skip",
+                    showlegend=True,
+                )
+            )
+
+        apply_panel_layout(
+            fig,
+            title="Warning horizon",
+            height=240,
+            top_margin=78,
+            bottom_margin=20,
+            legend_y=1.03,
+        )
+        fig.update_layout(
+            barmode="overlay",
+            xaxis={"title": "Hours from now", "range": [0, xmax]},
+            yaxis={"visible": False},
+        )
+        fig.add_annotation(
+            x=min(xmax - 1, intervention_h),
+            y=0,
+            text=f"{state}: {warning_profile['intervention_horizon_hours']}h to intervention boundary",
+            showarrow=False,
+            yshift=14,
+            xanchor="right",
+            font={"size": 13, "color": "#13212b"},
+        )
+        return fig
+
+
+    def _build_failure_progression_fig(precursor_df):
+        if precursor_df.empty:
+            return go.Figure()
+
+        fig = px.bar(
+            precursor_df.sort_values("Hours to limit", ascending=False),
+            x="Hours to limit",
+            y="Signal",
+            orientation="h",
+            color="Trend",
+            color_discrete_map={
+                "Rising": "#b45309",
+                "Falling": "#315c72",
+                "Stable": "#8aa1af",
+            },
+            text="Sequence",
+            title="Failure precursor ladder",
+        )
+        apply_panel_layout(
+            fig,
+            title="Failure precursor ladder",
+            height=340,
+            top_margin=74,
+            legend_y=1.03,
+        )
+        fig.update_traces(textposition="outside")
+        return fig
+
+
+    def _build_regime_fig(regime_summary):
+        if regime_summary.empty:
+            return go.Figure()
+
+        fig = px.bar(
+            regime_summary,
+            x="Regime",
+            y="Mean risk",
+            color="Share of time (%)",
+            color_continuous_scale=["#dbe5ea", "#8aa1af", "#315c72"],
+            text="Share label",
+            title="Operating regime lens",
+        )
+        apply_panel_layout(
+            fig,
+            title="Operating regime",
+            height=320,
+            top_margin=64,
+            show_legend=False,
+        )
+        fig.update_layout(coloraxis_colorbar_title="Share of time")
+        fig.update_traces(textposition="outside")
+        return fig
+
+
+    def _build_portfolio_fig(portfolio_table, x_col="RUL (h)"):
+        if portfolio_table.empty:
+            return go.Figure()
+
+        plot_df = portfolio_table.copy()
+        label_idx = (
+            portfolio_table.sort_values(
+                ["Risk score", "RUL (h)"], ascending=[False, True]
+            )
+            .head(3)
+            .index
+        )
+        plot_df["label"] = np.where(
+            plot_df.index.isin(label_idx), plot_df["Maintenance item"], ""
+        )
+        fig = px.scatter(
+            plot_df,
+            x=x_col,
+            y="Risk score",
+            size="Usability (%)",
+            color="Priority",
+            color_discrete_map={
+                "Intervene now": "#b91c1c",
+                "Plan next shift": "#cf8f3d",
+                "Monitor and defer": "#315c72",
+            },
+            hover_name="Maintenance item",
+            text="label",
+            title="Maintenance priority board",
+        )
+        fig.update_traces(textposition="top center", textfont_size=11)
+        apply_panel_layout(
+            fig,
+            title="Maintenance priority board",
+            height=380,
+            top_margin=78,
+            legend_y=1.03,
+        )
+        fig.add_hline(y=70, line_dash="dash", line_color="#b91c1c", opacity=0.6)
+        fig.add_vline(
+            x=max(12, float(portfolio_table[x_col].median())),
+            line_dash="dash",
+            line_color="#6b7280",
+            opacity=0.5,
+        )
+        return fig
+
+
+    def _build_economics_fig(economics_table):
+        if economics_table.empty:
+            return go.Figure()
+
+        fig = go.Figure()
+        palette = {
+            "Planned downtime": "#315c72",
+            "Failure exposure": "#b91c1c",
+            "Avoidable disruption": "#cf8f3d",
+        }
+        for column in [
+            "Planned downtime",
+            "Failure exposure",
+            "Avoidable disruption",
+        ]:
+            fig.add_trace(
+                go.Bar(
+                    x=economics_table["Scenario"],
+                    y=economics_table[column],
+                    name=column,
+                    marker={"color": palette[column]},
+                )
+            )
+        apply_panel_layout(
+            fig,
+            title="Maintenance economics",
+            height=360,
+            top_margin=78,
+            legend_y=1.03,
+        )
+        fig.update_layout(barmode="stack", yaxis_title="Relative cost index")
         return fig
 
 
@@ -756,58 +1051,236 @@ def _(
         comp_col = metro_state.get("comp_col")
         sensor_labels = metro_state.get("sensor_labels", {})
 
-        asset_df = (
-            df.loc[df[asset_col].astype(str) == selected_asset]
-            .sort_values(time_col)
-            .reset_index(drop=True)
-        )
-        risk = robust_risk_series(asset_df, sensor_cols, comp_col=comp_col)
-        asset_df = asset_df.assign(risk_score=risk, health_score=100 - risk)
+        def _summarize_entity(entity_df, label, context):
+            entity_df = entity_df.sort_values(time_col).reset_index(drop=True)
+            risk = robust_risk_series(entity_df, sensor_cols, comp_col=comp_col)
+            entity_df = entity_df.assign(risk_score=risk, health_score=100 - risk)
+            latest = entity_df.iloc[-1]
+            degradation = _compute_degradation(
+                entity_df, sensor_cols, time_col, comp_col
+            )
+            rul_info = _estimate_rul(
+                entity_df, risk, degradation, sensor_cols, time_col
+            )
+            schedule = _optimize_maintenance(
+                rul_info["composite_rul_hours"],
+                horizon_hours,
+                float(latest["risk_score"]),
+                rul_info["risk_threshold"],
+            )
+            usability = _compute_usability(degradation, sensor_cols)
+            warning_profile = _compute_warning_profile(
+                float(latest["risk_score"]), rul_info, schedule
+            )
+
+            latest_driver_scores = {}
+            for col in sensor_cols:
+                series = (
+                    entity_df[col]
+                    .astype(float)
+                    .interpolate(limit_direction="both")
+                )
+                baseline = (
+                    series.rolling(24, min_periods=4)
+                    .median()
+                    .fillna(series.median())
+                )
+                latest_driver_scores[col] = float(
+                    abs(series.iloc[-1] - baseline.iloc[-1])
+                )
+
+            driver_df = (
+                pd.DataFrame(
+                    {
+                        "signal": [
+                            sensor_labels.get(col, col)
+                            for col in latest_driver_scores
+                        ],
+                        "magnitude": list(latest_driver_scores.values()),
+                        "source_col": list(latest_driver_scores.keys()),
+                    }
+                )
+                .sort_values("magnitude", ascending=False)
+                .head(6)
+            )
+
+            precursor_rows = []
+            per_sensor_rul = rul_info["per_sensor_rul"]
+            for idx, col in enumerate(
+                sorted(per_sensor_rul, key=per_sensor_rul.get), start=1
+            ):
+                slope = degradation[col]["slope"]
+                precursor_rows.append(
+                    {
+                        "Sequence": f"#{idx}",
+                        "Signal": sensor_labels.get(col, col),
+                        "Hours to limit": round(float(per_sensor_rul[col]), 1),
+                        "Trend": "Rising"
+                        if slope > 0
+                        else "Falling"
+                        if slope < 0
+                        else "Stable",
+                        "Slope": round(float(abs(slope)), 4),
+                        "Usability (%)": round(
+                            float(usability["per_sensor"].get(col, 100.0)), 1
+                        ),
+                    }
+                )
+            precursor_df = pd.DataFrame(precursor_rows)
+
+            comp_series = (
+                entity_df[comp_col].astype(float).fillna(0.0)
+                if comp_col and comp_col in entity_df.columns
+                else pd.Series(1.0, index=entity_df.index)
+            )
+            transition_mask = comp_series.diff().abs().fillna(0).gt(0)
+            regime = np.where(
+                transition_mask,
+                "Transition",
+                np.where(comp_series >= 0.5, "Loaded", "Idle"),
+            )
+            regime_df = entity_df.assign(regime=regime)
+            regime_summary = (
+                regime_df.groupby("regime")
+                .agg(
+                    **{
+                        "Mean risk": ("risk_score", "mean"),
+                        "Peak risk": ("risk_score", "max"),
+                        "Hours": ("risk_score", "size"),
+                    }
+                )
+                .reset_index()
+                .rename(columns={"regime": "Regime"})
+            )
+            regime_summary["Share of time (%)"] = (
+                regime_summary["Hours"] / max(1, len(regime_df)) * 100
+            ).round(1)
+            regime_summary["Share label"] = regime_summary[
+                "Share of time (%)"
+            ].map(lambda v: f"{v:.0f}%")
+            regime_summary["Mean risk"] = regime_summary["Mean risk"].round(1)
+            regime_summary["Peak risk"] = regime_summary["Peak risk"].round(1)
+
+            incident_summary = {
+                "what_changed": ", ".join(driver_df["signal"].head(2).tolist()),
+                "where": f"{label} | weakest signal: {sensor_labels.get(rul_info['weakest_sensor'], rul_info['weakest_sensor'])}",
+                "consequence": f"Current risk {float(latest['risk_score']):.0f}/100 with {rul_info['composite_rul_hours']}h remaining runway.",
+                "recommended_action": f"{schedule['recommendation']} within {schedule['maintenance_window']}",
+            }
+
+            return {
+                "entity_df": entity_df,
+                "risk_score": float(latest["risk_score"]),
+                "health_score": float(latest["health_score"]),
+                "degradation": degradation,
+                "rul_info": rul_info,
+                "schedule": schedule,
+                "usability": usability,
+                "warning_profile": warning_profile,
+                "driver_df": driver_df,
+                "precursor_df": precursor_df,
+                "regime_summary": regime_summary,
+                "incident_summary": incident_summary,
+                "context": context,
+                "label": label,
+            }
+
+        asset_df = df.loc[df[asset_col].astype(str) == selected_asset].copy()
+        summary = _summarize_entity(asset_df, selected_asset, "Selected asset")
+        asset_df = summary["entity_df"]
         latest = asset_df.iloc[-1]
+        degradation = summary["degradation"]
+        rul_info = summary["rul_info"]
+        schedule = summary["schedule"]
+        usability = summary["usability"]
+        driver_df = summary["driver_df"]
+        precursor_df = summary["precursor_df"]
+        regime_summary = summary["regime_summary"]
+        warning_profile = summary["warning_profile"]
+        incident_summary = summary["incident_summary"]
 
-        # Degradation analysis
-        degradation = _compute_degradation(
-            asset_df, sensor_cols, time_col, comp_col
+        portfolio_rows = []
+        portfolio_note = ""
+        assets = metro_state.get("assets", [])
+        if len(assets) > 1:
+            for asset_name in assets:
+                entity_df = df.loc[df[asset_col].astype(str) == asset_name].copy()
+                if len(entity_df) < 24:
+                    continue
+                entity_summary = _summarize_entity(
+                    entity_df, str(asset_name), "Asset portfolio"
+                )
+                portfolio_rows.append(
+                    {
+                        "Maintenance item": str(asset_name),
+                        "Context": entity_summary["context"],
+                        "Risk score": round(entity_summary["risk_score"], 1),
+                        "RUL (h)": int(
+                            entity_summary["rul_info"]["composite_rul_hours"]
+                        ),
+                        "Warning horizon (h)": int(
+                            entity_summary["warning_profile"][
+                                "warning_horizon_hours"
+                            ]
+                        ),
+                        "Usability (%)": entity_summary["usability"][
+                            "composite_pct"
+                        ],
+                        "Priority": entity_summary["schedule"]["recommendation"],
+                    }
+                )
+        else:
+            split_indices = [
+                idx_slice
+                for idx_slice in np.array_split(asset_df.index.to_numpy(), 6)
+                if len(idx_slice) >= 24
+            ]
+            slices = [
+                asset_df.loc[idx_slice].copy() for idx_slice in split_indices
+            ]
+            portfolio_note = "Portfolio board is synthesized from maintenance backlog windows because the current raw file contains one physical asset."
+            for idx, chunk in enumerate(slices, start=1):
+                chunk = chunk.sort_values(time_col).reset_index(drop=True)
+                start_ts = pd.to_datetime(chunk[time_col].iloc[0])
+                end_ts = pd.to_datetime(chunk[time_col].iloc[-1])
+                label = f"Backlog-{idx}"
+                entity_summary = _summarize_entity(
+                    chunk, label, f"{start_ts.date()} to {end_ts.date()}"
+                )
+                portfolio_rows.append(
+                    {
+                        "Maintenance item": label,
+                        "Context": entity_summary["context"],
+                        "Risk score": round(entity_summary["risk_score"], 1),
+                        "RUL (h)": int(
+                            entity_summary["rul_info"]["composite_rul_hours"]
+                        ),
+                        "Warning horizon (h)": int(
+                            entity_summary["warning_profile"][
+                                "warning_horizon_hours"
+                            ]
+                        ),
+                        "Usability (%)": entity_summary["usability"][
+                            "composite_pct"
+                        ],
+                        "Priority": entity_summary["schedule"]["recommendation"],
+                    }
+                )
+
+        portfolio_table = pd.DataFrame(portfolio_rows)
+        if not portfolio_table.empty:
+            portfolio_table = portfolio_table.sort_values(
+                ["Risk score", "RUL (h)"], ascending=[False, True]
+            ).reset_index(drop=True)
+        high_priority_count = (
+            int((portfolio_table["Priority"] == "Intervene now").sum())
+            if not portfolio_table.empty
+            else 0
         )
-        rul_info = _estimate_rul(
-            asset_df, risk, degradation, sensor_cols, time_col
-        )
-        schedule = _optimize_maintenance(
-            rul_info["composite_rul_hours"],
-            horizon_hours,
-            float(latest["risk_score"]),
-            rul_info["risk_threshold"],
-        )
-        usability = _compute_usability(degradation, sensor_cols)
-
-        # Backward-compatible values
-        recommendation = schedule["recommendation"]
-        maintenance_window = schedule["maintenance_window"]
-        runway_hours = rul_info["composite_rul_hours"]
-        availability_proxy = usability["composite_pct"]
-
-        # Driver analysis using sensor labels
-        latest_driver_scores = {}
-        for col in sensor_cols:
-            series = (
-                asset_df[col].astype(float).interpolate(limit_direction="both")
-            )
-            baseline = (
-                series.rolling(24, min_periods=4).median().fillna(series.median())
-            )
-            deviation = abs(series.iloc[-1] - baseline.iloc[-1])
-            label = sensor_labels.get(col, col)
-            latest_driver_scores[label] = float(deviation)
-
-        driver_df = (
-            pd.DataFrame(
-                {
-                    "signal": list(latest_driver_scores.keys()),
-                    "magnitude": list(latest_driver_scores.values()),
-                }
-            )
-            .sort_values("magnitude", ascending=False)
-            .head(5)
+        next_shift_count = (
+            int((portfolio_table["Priority"] == "Plan next shift").sum())
+            if not portfolio_table.empty
+            else 0
         )
 
         view_cols = sensor_cols[:3]
@@ -855,13 +1328,12 @@ def _(
             row=2,
             col=1,
         )
-        trend_fig.update_layout(
+        apply_panel_layout(
+            trend_fig,
+            title="Telemetry and maintenance risk",
             height=540,
-            margin={"l": 20, "r": 20, "t": 30, "b": 10},
-            paper_bgcolor="#f5f7f9",
-            plot_bgcolor="#ffffff",
-            legend={"orientation": "h", "y": 1.08},
-            title="Asset telemetry and maintenance urgency",
+            top_margin=82,
+            legend_y=1.03,
         )
         trend_fig.update_yaxes(title_text="Telemetry", row=1, col=1)
         trend_fig.update_yaxes(
@@ -877,33 +1349,101 @@ def _(
             color_continuous_scale=["#dbe5ea", "#315c72", "#b45309"],
             title="Current maintenance drivers",
         )
-        driver_fig.update_layout(
+        apply_panel_layout(
+            driver_fig,
+            title="Current maintenance drivers",
             height=300,
-            margin={"l": 20, "r": 20, "t": 40, "b": 10},
-            paper_bgcolor="#f5f7f9",
-            plot_bgcolor="#ffffff",
-            coloraxis_showscale=False,
+            top_margin=68,
+            show_legend=False,
         )
+        driver_fig.update_layout(coloraxis_showscale=False)
         driver_fig.update_yaxes(categoryorder="total ascending")
 
         action_table = pd.DataFrame(
             [
                 {
-                    "Decision": recommendation,
-                    "Window": maintenance_window,
-                    "RUL (h)": runway_hours,
+                    "Decision": schedule["recommendation"],
+                    "Window": schedule["maintenance_window"],
+                    "RUL (h)": rul_info["composite_rul_hours"],
                     "Usability (%)": usability["composite_pct"],
                     "Optimal maint. (h)": schedule["optimal_hour"],
+                    "Warning horizon (h)": warning_profile[
+                        "warning_horizon_hours"
+                    ],
                 }
             ]
         )
 
-        # New figures
         deg_fig = _build_degradation_fig(
             asset_df, degradation, sensor_cols, time_col, sensor_labels
         )
         sched_fig = _build_schedule_fig(schedule)
         usability_fig = _build_usability_fig(usability, sensor_labels)
+        warning_fig = _build_warning_timeline_fig(warning_profile)
+        progression_fig = _build_failure_progression_fig(precursor_df)
+        regime_fig = _build_regime_fig(regime_summary)
+        portfolio_fig = (
+            _build_portfolio_fig(portfolio_table)
+            if not portfolio_table.empty
+            else go.Figure()
+        )
+
+        economics_table = pd.DataFrame(
+            [
+                {
+                    "Scenario": "Intervene now",
+                    "Timing (h)": 0,
+                    "Planned downtime": 34,
+                    "Failure exposure": max(6, int(summary["risk_score"] * 0.18)),
+                    "Avoidable disruption": 26,
+                },
+                {
+                    "Scenario": "Optimal window",
+                    "Timing (h)": schedule["optimal_hour"],
+                    "Planned downtime": 20,
+                    "Failure exposure": int(schedule["failure_at_optimal"] * 100),
+                    "Avoidable disruption": 10,
+                },
+                {
+                    "Scenario": "Defer beyond runway",
+                    "Timing (h)": int(
+                        max(
+                            schedule["optimal_hour"] + 24,
+                            rul_info["composite_rul_hours"],
+                        )
+                    ),
+                    "Planned downtime": 12,
+                    "Failure exposure": min(
+                        95,
+                        int(
+                            max(
+                                schedule["failure_at_optimal"] * 155,
+                                summary["risk_score"] * 0.9,
+                            )
+                        ),
+                    ),
+                    "Avoidable disruption": 34,
+                },
+            ]
+        )
+        economics_table["Total cost index"] = economics_table[
+            ["Planned downtime", "Failure exposure", "Avoidable disruption"]
+        ].sum(axis=1)
+        economics_table["Failure risk (%)"] = economics_table[
+            "Failure exposure"
+        ].map(lambda v: f"{v:.0f}%")
+        economics_fig = _build_economics_fig(economics_table)
+
+        incident_card = {
+            "title": sensor_labels.get(
+                rul_info["weakest_sensor"], rul_info["weakest_sensor"]
+            ),
+            "state": warning_profile["state"],
+            "what_changed": incident_summary["what_changed"],
+            "where": incident_summary["where"],
+            "consequence": incident_summary["consequence"],
+            "recommended_action": incident_summary["recommended_action"],
+        }
 
         return {
             "asset_df": asset_df,
@@ -912,10 +1452,10 @@ def _(
             "action_table": action_table,
             "risk_score": float(latest["risk_score"]),
             "health_score": float(latest["health_score"]),
-            "availability_proxy": float(availability_proxy),
-            "runway_hours": runway_hours,
-            "recommendation": recommendation,
-            "maintenance_window": maintenance_window,
+            "availability_proxy": float(usability["composite_pct"]),
+            "runway_hours": rul_info["composite_rul_hours"],
+            "recommendation": schedule["recommendation"],
+            "maintenance_window": schedule["maintenance_window"],
             "driver_df": driver_df,
             "degradation": degradation,
             "rul_info": rul_info,
@@ -925,6 +1465,20 @@ def _(
             "sched_fig": sched_fig,
             "usability_fig": usability_fig,
             "sensor_labels": sensor_labels,
+            "warning_profile": warning_profile,
+            "warning_fig": warning_fig,
+            "precursor_df": precursor_df,
+            "progression_fig": progression_fig,
+            "regime_summary": regime_summary,
+            "regime_fig": regime_fig,
+            "portfolio_table": portfolio_table,
+            "portfolio_fig": portfolio_fig,
+            "portfolio_note": portfolio_note,
+            "high_priority_count": high_priority_count,
+            "next_shift_count": next_shift_count,
+            "economics_table": economics_table,
+            "economics_fig": economics_fig,
+            "incident_card": incident_card,
         }
 
 
@@ -1370,13 +1924,14 @@ def _(
                 },
             )
         )
-        fig.update_layout(
+        apply_panel_layout(
+            fig,
+            title="Lot containment flow",
             height=380,
-            margin={"l": 20, "r": 20, "t": 42, "b": 20},
-            paper_bgcolor="#f5f7f9",
-            font={"size": 13, "color": "#13212b"},
-            title="Containment flow from source lot to field action",
+            top_margin=74,
+            show_legend=False,
         )
+        fig.update_layout(font={"size": 13, "color": "#13212b"})
         return fig
 
 
@@ -1414,15 +1969,15 @@ def _(
                 insidetextanchor="middle",
             )
         )
-        fig.update_layout(
-            barmode="stack",
-            height=380,
-            margin={"l": 20, "r": 20, "t": 42, "b": 20},
-            paper_bgcolor="#f5f7f9",
-            plot_bgcolor="#ffffff",
+        apply_panel_layout(
+            fig,
             title="Downstream impact split",
-            legend={"orientation": "h", "y": 1.12},
+            height=380,
+            top_margin=72,
+            bottom_margin=20,
+            show_legend=False,
         )
+        fig.update_layout(barmode="stack")
         fig.update_xaxes(title_text="Vehicle count", range=[0, total])
         fig.add_annotation(
             x=total,
@@ -1431,9 +1986,122 @@ def _(
             showarrow=False,
             xanchor="right",
             yanchor="bottom",
-            yshift=26,
+            yshift=16,
             font={"size": 13, "color": "#13212b"},
         )
+        return fig
+
+
+    def _build_process_drift_fig(modeled_df, supplier_col, line_col, shift_col):
+        grouped = (
+            modeled_df.groupby([supplier_col, line_col, shift_col])
+            .agg(avg_risk=("predicted_risk", "mean"))
+            .reset_index()
+        )
+        grouped["Line / Shift"] = (
+            grouped[line_col].astype(str) + " / " + grouped[shift_col].astype(str)
+        )
+        pivot = grouped.pivot_table(
+            index=supplier_col,
+            columns="Line / Shift",
+            values="avg_risk",
+            fill_value=0,
+        )
+        fig = px.imshow(
+            pivot,
+            color_continuous_scale=["#dbe5ea", "#8aa1af", "#cf8f3d", "#b91c1c"],
+            aspect="auto",
+            title="Process drift by supplier / line / shift",
+        )
+        apply_panel_layout(
+            fig,
+            title="Process drift by supplier / line / shift",
+            height=360,
+            top_margin=74,
+            show_legend=False,
+        )
+        fig.update_layout(coloraxis_colorbar_title="Avg risk")
+        return fig
+
+
+    def _build_quality_fingerprint_fig(lead_indicator_table):
+        if lead_indicator_table.empty:
+            return go.Figure()
+        fig = px.bar(
+            lead_indicator_table.sort_values(
+                "Delta vs healthy (z)", ascending=True
+            ),
+            x="Delta vs healthy (z)",
+            y="Signal",
+            orientation="h",
+            color="Direction",
+            color_discrete_map={
+                "Higher than healthy": "#b91c1c",
+                "Lower than healthy": "#315c72",
+            },
+            title="Suspect lot fingerprint vs healthy baseline",
+        )
+        apply_panel_layout(
+            fig,
+            title="Suspect lot fingerprint vs healthy baseline",
+            height=340,
+            top_margin=74,
+            legend_y=1.03,
+        )
+        return fig
+
+
+    def _build_quality_control_fig(batch_summary, batch_col, focus_batch):
+        chart_df = batch_summary.sort_values(batch_col).copy()
+        center = float(chart_df["avg_risk"].mean())
+        upper = float(chart_df["avg_risk"].mean() + chart_df["avg_risk"].std())
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=chart_df[batch_col],
+                y=chart_df["avg_risk"],
+                mode="lines+markers",
+                name="Avg batch risk",
+                line={"width": 2, "color": "#315c72"},
+            )
+        )
+        focus_row = chart_df.loc[
+            chart_df[batch_col].astype(str) == str(focus_batch)
+        ]
+        if not focus_row.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=focus_row[batch_col],
+                    y=focus_row["avg_risk"],
+                    mode="markers",
+                    name="Focus lot",
+                    marker={
+                        "size": 14,
+                        "color": "#b91c1c",
+                        "line": {"color": "#ffffff", "width": 1.5},
+                    },
+                )
+            )
+        fig.add_hline(
+            y=center,
+            line_dash="dash",
+            line_color="#6b7280",
+            annotation_text="Center line",
+        )
+        fig.add_hline(
+            y=upper,
+            line_dash="dot",
+            line_color="#cf8f3d",
+            annotation_text="Early warning band",
+        )
+        apply_panel_layout(
+            fig,
+            title="Batch quality control chart",
+            height=360,
+            top_margin=74,
+            legend_y=1.03,
+        )
+        fig.update_layout(xaxis_title="Batch", yaxis_title="Avg predicted risk")
         return fig
 
 
@@ -1575,9 +2243,7 @@ def _(
             "Ready to notify owners and field service",
         )
         vehicle_actions["Action_Priority"] = np.where(
-            vehicle_actions[sale_status_col].eq("unsold"),
-            "P1 hold",
-            "P1 recall",
+            vehicle_actions[sale_status_col].eq("unsold"), "P1 hold", "P1 recall"
         )
         vehicle_actions["avg_risk"] = vehicle_actions["avg_risk"].round(2)
         vehicle_actions["peak_cell_risk"] = vehicle_actions[
@@ -1597,10 +2263,13 @@ def _(
             hole=0.55,
             title="Quality mix for current filters",
         )
-        qc_fig.update_layout(
+        apply_panel_layout(
+            qc_fig,
+            title="Quality mix for current filters",
             height=320,
-            margin={"l": 20, "r": 20, "t": 40, "b": 20},
-            paper_bgcolor="#f5f7f9",
+            top_margin=70,
+            bottom_margin=20,
+            legend_y=1.03,
         )
 
         hotspot_fig = px.bar(
@@ -1612,13 +2281,15 @@ def _(
             color_continuous_scale=["#dbe5ea", "#cf8f3d", "#b91c1c"],
             title="Supplier genealogy hotspots",
         )
-        hotspot_fig.update_layout(
+        apply_panel_layout(
+            hotspot_fig,
+            title="Supplier genealogy hotspots",
             height=320,
-            margin={"l": 20, "r": 20, "t": 40, "b": 20},
-            paper_bgcolor="#f5f7f9",
-            plot_bgcolor="#ffffff",
-            coloraxis_colorbar_title="Affected share",
+            top_margin=70,
+            bottom_margin=20,
+            show_legend=False,
         )
+        hotspot_fig.update_layout(coloraxis_colorbar_title="Affected share")
 
         importance_fig = px.bar(
             importance_df.sort_values("importance", ascending=True),
@@ -1629,17 +2300,42 @@ def _(
             color="importance",
             color_continuous_scale=["#dbe5ea", "#315c72", "#b45309"],
         )
-        importance_fig.update_layout(
+        apply_panel_layout(
+            importance_fig,
+            title="Batch quality risk drivers",
             height=340,
-            margin={"l": 20, "r": 20, "t": 40, "b": 20},
-            paper_bgcolor="#f5f7f9",
-            plot_bgcolor="#ffffff",
-            coloraxis_showscale=False,
+            top_margin=70,
+            bottom_margin=20,
+            show_legend=False,
         )
+        importance_fig.update_layout(coloraxis_showscale=False)
 
         lineage_fig = lineage_figure(vehicle_actions, lot_col)
+        impact_fig = impact_split_figure(
+            pd.DataFrame(
+                [
+                    {
+                        "Cluster": "Unsold vehicles on dealer lots",
+                        "Vehicle count": int(
+                            vehicle_actions.loc[
+                                vehicle_actions[sale_status_col].eq("unsold"),
+                                vehicle_col,
+                            ].nunique()
+                        ),
+                    },
+                    {
+                        "Cluster": "Sold vehicles requiring recall",
+                        "Vehicle count": int(
+                            vehicle_actions.loc[
+                                vehicle_actions[sale_status_col].eq("sold"),
+                                vehicle_col,
+                            ].nunique()
+                        ),
+                    },
+                ]
+            )
+        )
 
-        top_batch = batch_summary.iloc[0]
         defect_view = (
             focus_rows.groupby(defect_col)
             .size()
@@ -1675,76 +2371,28 @@ def _(
             .map(lambda value: f"{value:.1f}%")
         )
 
-        dealer_hold_table = (
-            vehicle_actions.loc[
-                vehicle_actions[sale_status_col].eq("unsold"),
-                [
-                    vehicle_col,
-                    dealer_col,
-                    market_col,
-                    "avg_risk",
-                    "worst_grade",
-                    "dominant_defect",
-                    "recommended_action",
-                    "Action_Status",
-                ],
-            ]
-            .rename(
-                columns={
-                    vehicle_col: "Vehicle ID",
-                    dealer_col: "Dealer",
-                    market_col: "Market",
-                    "avg_risk": "Avg risk",
-                    "worst_grade": "Worst grade",
-                    "dominant_defect": "Likely defect",
-                    "recommended_action": "Action",
-                    "Action_Status": "Action status",
-                }
-            )
-            .reset_index(drop=True)
-        )
-
-        recall_table = (
-            vehicle_actions.loc[
-                vehicle_actions[sale_status_col].eq("sold"),
-                [
-                    vehicle_col,
-                    dealer_col,
-                    market_col,
-                    "avg_risk",
-                    "worst_grade",
-                    "dominant_defect",
-                    "recommended_action",
-                    "Action_Status",
-                ],
-            ]
-            .rename(
-                columns={
-                    vehicle_col: "Vehicle ID",
-                    dealer_col: "Origin dealer",
-                    market_col: "Market",
-                    "avg_risk": "Avg risk",
-                    "worst_grade": "Worst grade",
-                    "dominant_defect": "Likely defect",
-                    "recommended_action": "Action",
-                    "Action_Status": "Action status",
-                }
-            )
-            .reset_index(drop=True)
-        )
-
         containment_actions = pd.DataFrame(
             [
                 {
                     "Cluster": "Unsold vehicles on dealer lots",
-                    "Vehicle count": int(dealer_hold_table.shape[0]),
+                    "Vehicle count": int(
+                        vehicle_actions.loc[
+                            vehicle_actions[sale_status_col].eq("unsold"),
+                            vehicle_col,
+                        ].nunique()
+                    ),
                     "Recommended action": "Send dealer hold notice and quarantine inventory",
                     "Owner": "Dealer operations",
                     "Priority": "P1 hold",
                 },
                 {
                     "Cluster": "Sold vehicles requiring recall",
-                    "Vehicle count": int(recall_table.shape[0]),
+                    "Vehicle count": int(
+                        vehicle_actions.loc[
+                            vehicle_actions[sale_status_col].eq("sold"),
+                            vehicle_col,
+                        ].nunique()
+                    ),
                     "Recommended action": "Launch recall / urgent inspection campaign",
                     "Owner": "Field service + customer care",
                     "Priority": "P1 recall",
@@ -1810,15 +2458,92 @@ def _(
             "line": focus_line,
             "shift": focus_shift,
             "impacted_vehicle_count": int(vehicle_actions.shape[0]),
-            "dealer_hold_count": int(dealer_hold_table.shape[0]),
-            "recall_count": int(recall_table.shape[0]),
+            "dealer_hold_count": int(containment_actions.iloc[0]["Vehicle count"]),
+            "recall_count": int(containment_actions.iloc[1]["Vehicle count"]),
             "avg_risk": round(float(focus_rows["predicted_risk"].mean()), 2),
             "dominant_defect": dominant_defect,
             "worst_grade": worst_grade,
             "business_action": "Hold unsold dealer inventory now and issue urgent recall / inspection for sold vehicles.",
         }
 
-        impact_fig = impact_split_figure(containment_actions)
+        feature_candidates = [
+            "Ambient_Temp_C",
+            "Anode_Overhang_mm",
+            "Electrolyte_Volume_ml",
+            "Internal_Resistance_mOhm",
+            "Capacity_mAh",
+            "Retention_50Cycle_Pct",
+        ]
+        quality_features = [
+            col for col in feature_candidates if col in modeled_df.columns
+        ]
+        healthy_baseline = modeled_df.loc[
+            (modeled_df[grade_col].astype(str) == "Grade A")
+            & (
+                modeled_df["predicted_risk"]
+                <= modeled_df["predicted_risk"].quantile(0.35)
+            ),
+            quality_features,
+        ].copy()
+        if healthy_baseline.empty:
+            healthy_baseline = modeled_df[quality_features].copy()
+        focus_signature = focus_rows[quality_features].mean(numeric_only=True)
+        baseline_mean = healthy_baseline.mean(numeric_only=True)
+        baseline_std = (
+            healthy_baseline.std(numeric_only=True).replace(0, np.nan).fillna(1.0)
+        )
+        lead_indicator_table = pd.DataFrame(
+            {
+                "Signal": [
+                    col.replace("_", " ").replace("Pct", "%").title()
+                    for col in quality_features
+                ],
+                "Delta vs healthy (z)": (
+                    (focus_signature - baseline_mean) / baseline_std
+                ).values,
+            }
+        )
+        lead_indicator_table["Direction"] = np.where(
+            lead_indicator_table["Delta vs healthy (z)"] >= 0,
+            "Higher than healthy",
+            "Lower than healthy",
+        )
+        lead_indicator_table["Delta vs healthy (z)"] = lead_indicator_table[
+            "Delta vs healthy (z)"
+        ].round(2)
+        lead_indicator_table = lead_indicator_table.reindex(
+            lead_indicator_table["Delta vs healthy (z)"]
+            .abs()
+            .sort_values(ascending=False)
+            .index
+        ).reset_index(drop=True)
+
+        process_drift_fig = _build_process_drift_fig(
+            modeled_df, supplier_col, line_col, shift_col
+        )
+        fingerprint_fig = _build_quality_fingerprint_fig(
+            lead_indicator_table.head(6)
+        )
+        quality_control_fig = _build_quality_control_fig(
+            batch_summary, batch_col, focus_batch
+        )
+
+        predictive_quality_summary = pd.DataFrame(
+            [
+                {
+                    "View": "Process drift",
+                    "Takeaway": f"{supplier_hotspots.iloc[0][supplier_col]} is the highest-risk supplier pattern in the current data.",
+                },
+                {
+                    "View": "Fingerprint",
+                    "Takeaway": f"{lead_indicator_table.iloc[0]['Signal']} is the largest deviation from the healthy process baseline.",
+                },
+                {
+                    "View": "Control chart",
+                    "Takeaway": f"Batch {focus_batch} is highlighted as the current focus lot for quality escalation.",
+                },
+            ]
+        )
 
         return {
             "modeled_df": modeled_df,
@@ -1829,15 +2554,18 @@ def _(
             "lineage_fig": lineage_fig,
             "impact_fig": impact_fig,
             "batch_summary": batch_summary,
-            "top_batch": top_batch,
+            "top_batch": batch_summary.iloc[0],
             "focus_batch": focus_batch,
             "defect_table": defect_table,
             "affected_lots": affected_lots,
-            "dealer_hold_table": dealer_hold_table,
-            "recall_table": recall_table,
             "containment_actions": containment_actions,
             "action_queue": action_queue,
             "containment_summary": containment_summary,
+            "process_drift_fig": process_drift_fig,
+            "fingerprint_fig": fingerprint_fig,
+            "quality_control_fig": quality_control_fig,
+            "lead_indicator_table": lead_indicator_table,
+            "predictive_quality_summary": predictive_quality_summary,
         }
 
 
@@ -2061,27 +2789,27 @@ def _(ev_analysis, metro_analysis, mo):
                 bordered=True,
             ),
             mo.stat(
+                value=f"{metro_analysis['warning_profile']['warning_horizon_hours']}h",
+                label="early warning horizon",
+                caption=metro_analysis["warning_profile"]["state"],
+                bordered=True,
+            ),
+            mo.stat(
                 value=f"{metro_analysis['rul_info']['composite_rul_hours']}h",
                 label="remaining useful life",
                 caption=f"optimal maint. at {metro_analysis['schedule']['optimal_hour']}h",
                 bordered=True,
             ),
             mo.stat(
+                value=str(metro_analysis["high_priority_count"]),
+                label="priority maintenance items",
+                caption=f"{metro_analysis['next_shift_count']} plan-next-shift items",
+                bordered=True,
+            ),
+            mo.stat(
                 value=ev_analysis["containment_summary"]["affected_lot"],
-                label="affected lot",
-                caption=f"{ev_analysis['containment_summary']['supplier']} / {ev_analysis['containment_summary']['line']}",
-                bordered=True,
-            ),
-            mo.stat(
-                value=str(ev_analysis["containment_summary"]["dealer_hold_count"]),
-                label="dealer hold units",
-                caption="unsold inventory to quarantine",
-                bordered=True,
-            ),
-            mo.stat(
-                value=str(ev_analysis["containment_summary"]["recall_count"]),
-                label="recall units",
-                caption="sold vehicles needing urgent inspection",
+                label="active quality lot",
+                caption="enterprise proof point",
                 bordered=True,
             ),
         ],
@@ -2099,13 +2827,11 @@ def _(ROOT, mo):
         f"""
         ### Kaggle inspiration used in this app
 
+        - [MetroPT-3 starter](https://www.kaggle.com/code/joebeachcapital/metropt-3-data-import-eda-starter): time-series framing and telemetry-first storytelling.
+        - [Predictive maintenance and XAI](https://www.kaggle.com/code/chinmayadatt/notebook-predictive-maintenance-and-xai/notebook): maintenance-driver and explainability framing.
+        - [EV Battery QC code gallery](https://www.kaggle.com/datasets/kanchana1990/ev-battery-qc-synthetic-defect-dataset/code): lot-level storytelling and QC drilldowns.
 
-        - [MetroPT-3 | Data Import & EDA Starter](https://www.kaggle.com/code/joebeachcapital/metropt-3-data-import-eda-starter): inspired the time-series framing and clean telemetry-first story.s
-        - [Notebook Predictive Maintenance and XAI](https://www.kaggle.com/code/chinmayadatt/notebook-predictive-maintenance-and-xai/notebook): inspired the maintenance-driver and explainability lens.
-        - [EV Battery QC code gallery](https://www.kaggle.com/datasets/kanchana1990/ev-battery-qc-synthetic-defect-dataset/code): used as the live reference point for batch-level storytelling and QC drilldowns.
-
-
-        Data placement details live in [`data/README.md`]({ROOT / "data" / "README.md"}).
+        Data placement details: [`data/README.md`]({ROOT / "data" / "README.md"}).
         """
     )
     inspiration
@@ -2113,7 +2839,100 @@ def _(ROOT, mo):
 
 
 @app.cell(hide_code=True)
-def _(ev_analysis, metro_analysis, mo, pd):
+def _(ev_analysis, metro_analysis, mo):
+    maintenance_summary = mo.Html(
+        f"""
+        <style>
+          .pm-maint-grid {{
+            display: grid;
+            grid-template-columns: minmax(280px, 1.6fr) repeat(4, minmax(130px, 1fr));
+            gap: 12px;
+            margin-bottom: 0.2rem;
+          }}
+          .pm-maint-hero, .pm-maint-stat {{
+            border-radius: 18px;
+            border: 1px solid #dbe3e8;
+            background: #ffffff;
+            box-shadow: 0 10px 22px rgba(49, 92, 114, 0.08);
+          }}
+          .pm-maint-hero {{
+            padding: 16px 18px;
+            background: linear-gradient(135deg, #13212b 0%, #315c72 62%, #8aa1af 100%);
+            color: #ffffff;
+          }}
+          .pm-maint-hero .eyebrow {{
+            font-size: 0.76rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            opacity: 0.82;
+          }}
+          .pm-maint-hero h3 {{
+            margin: 0.35rem 0 0.25rem;
+            font-size: 1.45rem;
+          }}
+          .pm-maint-hero p {{
+            margin: 0.2rem 0;
+            line-height: 1.35;
+            color: rgba(255,255,255,0.88);
+          }}
+          .pm-maint-stat {{
+            padding: 14px 16px;
+          }}
+          .pm-maint-stat .label {{
+            color: #5a6b76;
+            font-size: 0.82rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+          }}
+          .pm-maint-stat .value {{
+            margin-top: 0.35rem;
+            font-size: 1.45rem;
+            font-weight: 700;
+            color: #13212b;
+          }}
+          .pm-maint-stat .caption {{
+            margin-top: 0.15rem;
+            color: #5a6b76;
+            font-size: 0.92rem;
+          }}
+          @media (max-width: 1100px) {{
+            .pm-maint-grid {{
+              grid-template-columns: repeat(2, minmax(180px, 1fr));
+            }}
+          }}
+        </style>
+        <div class="pm-maint-grid">
+          <div class="pm-maint-hero">
+            <div class="eyebrow">Selected maintenance case</div>
+            <h3>{metro_analysis["incident_card"]["state"]}</h3>
+            <p>{metro_analysis["incident_card"]["what_changed"]}</p>
+            <p>{metro_analysis["incident_card"]["consequence"]}</p>
+            <p>{metro_analysis["incident_card"]["recommended_action"]}</p>
+          </div>
+          <div class="pm-maint-stat">
+            <div class="label">Warning horizon</div>
+            <div class="value">{metro_analysis["warning_profile"]["warning_horizon_hours"]}h</div>
+            <div class="caption">Lead time before warning band</div>
+          </div>
+          <div class="pm-maint-stat">
+            <div class="label">RUL</div>
+            <div class="value">{metro_analysis["rul_info"]["composite_rul_hours"]}h</div>
+            <div class="caption">Weakest link: {metro_analysis["sensor_labels"].get(metro_analysis["rul_info"]["weakest_sensor"], metro_analysis["rul_info"]["weakest_sensor"])}</div>
+          </div>
+          <div class="pm-maint-stat">
+            <div class="label">Priority queue</div>
+            <div class="value">{metro_analysis["high_priority_count"]}</div>
+            <div class="caption">Maintenance items needing immediate attention</div>
+          </div>
+          <div class="pm-maint-stat">
+            <div class="label">Next shift plan</div>
+            <div class="value">{metro_analysis["next_shift_count"]}</div>
+            <div class="caption">Items to schedule in the next shift</div>
+          </div>
+        </div>
+        """
+    )
+
     lot_summary = mo.Html(
         f"""
         <style>
@@ -2177,7 +2996,7 @@ def _(ev_analysis, metro_analysis, mo, pd):
         </style>
         <div class="pm-lot-grid">
           <div class="pm-lot-hero">
-            <div class="eyebrow">Active containment case</div>
+            <div class="eyebrow">Enterprise proof point</div>
             <h3>{ev_analysis["containment_summary"]["affected_lot"]}</h3>
             <p>{ev_analysis["containment_summary"]["supplier"]} / {ev_analysis["containment_summary"]["line"]} / {ev_analysis["containment_summary"]["shift"]}</p>
             <p>{ev_analysis["containment_summary"]["business_action"]}</p>
@@ -2211,109 +3030,134 @@ def _(ev_analysis, metro_analysis, mo, pd):
         """
     )
 
+
+    def panel(title, body):
+        return mo.vstack([mo.md(f"#### {title}"), body], gap=0.35)
+
+
+    executive_containment_actions = ev_analysis["containment_actions"].copy()
+    executive_containment_actions["Recommended action"] = (
+        executive_containment_actions["Recommended action"].replace(
+            {
+                "Send dealer hold notice and quarantine inventory": "Dealer hold and quarantine",
+                "Launch recall / urgent inspection campaign": "Recall and urgent inspection",
+            }
+        )
+    )
+
     executive_view = mo.vstack(
         [
             mo.md(
                 f"""
                 ### Executive overview
 
-                - **Maintenance posture:** {metro_analysis["recommendation"]} for the selected asset, with an action window of **{metro_analysis["maintenance_window"]}**.
-                - **Remaining useful life:** estimated at **{metro_analysis["rul_info"]["composite_rul_hours"]}h**, limited by **{metro_analysis["rul_info"]["weakest_sensor"]}**. Optimal maintenance at **{metro_analysis["schedule"]["optimal_hour"]}h**.
-                - **Containment posture:** lot **{ev_analysis["containment_summary"]["affected_lot"]}** from **{ev_analysis["containment_summary"]["supplier"]} / {ev_analysis["containment_summary"]["line"]} / {ev_analysis["containment_summary"]["shift"]}** is the active field-action lot.
-                - **Downstream exposure:** **{ev_analysis["containment_summary"]["impacted_vehicle_count"]}** vehicles traced so far: **{ev_analysis["containment_summary"]["dealer_hold_count"]}** unsold units still on dealer lots and **{ev_analysis["containment_summary"]["recall_count"]}** sold units needing urgent inspection.
-                - **Business action:** {ev_analysis["containment_summary"]["business_action"]}
+                - **Predictive maintenance posture:** {metro_analysis["recommendation"]} for the selected asset, with an action window of **{metro_analysis["maintenance_window"]}**.
+                - **Early warning:** the system is surfacing a **{metro_analysis["warning_profile"]["state"]}** signal with **{metro_analysis["warning_profile"]["warning_horizon_hours"]}h** of warning lead time.
+                - **Failure progression:** the current issue is being driven first by **{metro_analysis["incident_card"]["title"]}**, then by the next-ranked precursor signals in the failure ladder.
+                - **Portfolio view:** the notebook now prioritizes a maintenance backlog, not just one machine. Immediate-action items: **{metro_analysis["high_priority_count"]}**.
+                - **Enterprise proof:** the same stack also drives downstream traceability and containment through lot genealogy when a process-quality issue is detected.
                 """
             ),
+            maintenance_summary,
+            panel(
+                "Maintenance actions",
+                mo.ui.table(
+                    metro_analysis["action_table"], selection=None, page_size=4
+                ),
+            ),
+            panel(
+                "Quality containment actions",
+                mo.ui.table(
+                    executive_containment_actions, selection=None, page_size=4
+                ),
+            ),
+        ],
+        gap=1.0,
+    )
+
+    fleet_view = mo.vstack(
+        [
+            mo.md(
+                f"""
+                ### Fleet maintenance command center
+
+                This view leads with predictive maintenance. It shows the selected asset’s telemetry, the early warning runway, and the ranked maintenance queue that operations would triage first.
+                {metro_analysis["portfolio_note"]}
+                """
+            ),
+            maintenance_summary,
             mo.hstack(
-                [
-                    mo.vstack(
-                        [
-                            mo.md("#### Maintenance actions"),
-                            mo.ui.table(
-                                metro_analysis["action_table"],
-                                selection=None,
-                                page_size=5,
-                            ),
-                        ],
-                        gap=0.5,
-                    ),
-                    mo.vstack(
-                        [
-                            mo.md("#### Field actions"),
-                            mo.ui.table(
-                                ev_analysis["containment_actions"],
-                                selection=None,
-                                page_size=5,
-                            ),
-                        ],
-                        gap=0.5,
-                    ),
-                ],
-                widths="equal",
+                [metro_analysis["trend_fig"], metro_analysis["warning_fig"]],
+                widths=[1.7, 1],
                 gap=1.0,
                 wrap=True,
                 align="stretch",
             ),
+            mo.hstack(
+                [metro_analysis["portfolio_fig"], metro_analysis["regime_fig"]],
+                widths=[1.4, 1],
+                gap=1.0,
+                wrap=True,
+                align="stretch",
+            ),
+            panel(
+                "Maintenance backlog",
+                mo.ui.table(
+                    metro_analysis["portfolio_table"],
+                    selection=None,
+                    page_size=6,
+                ),
+            ),
         ],
-        gap=0.8,
+        gap=1.0,
     )
 
-    metro_view = mo.vstack(
+    failure_view = mo.vstack(
         [
-            metro_analysis["trend_fig"],
+            mo.md(
+                f"""
+                ### Failure progression
+
+                This view explains what changed, which signals will hit their limits first, and why the model is recommending the current intervention window.
+                """
+            ),
             metro_analysis["driver_fig"],
-            mo.ui.table(metro_analysis["driver_df"], selection=None, page_size=5),
+            metro_analysis["progression_fig"],
+            panel(
+                "Failure precursor ladder",
+                mo.ui.table(
+                    metro_analysis["precursor_df"], selection=None, page_size=8
+                ),
+            ),
             metro_analysis["deg_fig"],
         ],
-        gap=0.8,
+        gap=1.0,
     )
 
-    schedule_view = mo.vstack(
+    maintenance_econ_view = mo.vstack(
         [
             mo.md(
                 f"""
-                ### Maintenance schedule optimizer
+                ### Maintenance economics
 
-                The optimizer balances **productive uptime** against **failure probability** to find the best maintenance window.
-                Current failure probability at optimal time ({metro_analysis["schedule"]["optimal_hour"]}h): **{metro_analysis["schedule"]["failure_at_optimal"]:.1%}**.
+                The economics layer is deliberately heuristic. It translates the intervention timing recommendation into a directional business tradeoff between planned downtime, failure exposure, and avoidable disruption.
                 """
             ),
-            metro_analysis["sched_fig"],
-            mo.ui.table(
-                metro_analysis["action_table"], selection=None, page_size=5
+            mo.hstack(
+                [metro_analysis["sched_fig"], metro_analysis["economics_fig"]],
+                widths=[1.2, 1],
+                gap=1.0,
+                wrap=True,
+                align="stretch",
+            ),
+            panel(
+                "Scenario comparison",
+                mo.ui.table(
+                    metro_analysis["economics_table"], selection=None, page_size=4
+                ),
             ),
         ],
-        gap=0.8,
-    )
-
-    usability_view = mo.vstack(
-        [
-            mo.md(
-                f"""
-                ### Asset usability breakdown
-
-                Composite usability: **{metro_analysis["usability"]["composite_pct"]:.0f}%** of design envelope.
-                Sensors degrading fastest have higher weight in the composite score.
-                """
-            ),
-            metro_analysis["usability_fig"],
-            mo.ui.table(
-                pd.DataFrame(
-                    [
-                        {
-                            "Sensor": metro_analysis["sensor_labels"].get(k, k),
-                            "Usability (%)": v,
-                        }
-                        for k, v in metro_analysis["usability"][
-                            "per_sensor"
-                        ].items()
-                    ]
-                ).sort_values("Usability (%)", ascending=True),
-                selection=None,
-                page_size=10,
-            ),
-        ],
-        gap=0.8,
+        gap=1.0,
     )
 
     genealogy_view = mo.vstack(
@@ -2322,7 +3166,7 @@ def _(ev_analysis, metro_analysis, mo, pd):
                 f"""
                 ### Lot genealogy and containment
 
-                This page is now structured as a client demo narrative: the incident is summarized first, the source-to-action flow is visualized second, and the operational queue comes last.
+                Lot genealogy remains the enterprise proof point: the same platform that detects degrading equipment health can also trace process issues into concrete field actions.
                 """
             ),
             lot_summary,
@@ -2333,72 +3177,72 @@ def _(ev_analysis, metro_analysis, mo, pd):
                 wrap=True,
                 align="stretch",
             ),
-            mo.vstack(
-                [
-                    mo.md("#### Operational action queue"),
-                    mo.ui.table(
-                        ev_analysis["action_queue"], selection=None, page_size=10
-                    ),
-                ],
-                gap=0.5,
+            panel(
+                "Operational action queue",
+                mo.ui.table(
+                    ev_analysis["action_queue"], selection=None, page_size=8
+                ),
             ),
-            mo.hstack(
-                [
-                    mo.vstack(
-                        [
-                            mo.md("#### Supporting lot evidence"),
-                            mo.ui.table(
-                                ev_analysis["affected_lots"],
-                                selection=None,
-                                page_size=5,
-                            ),
-                        ],
-                        gap=0.5,
-                    ),
-                    mo.vstack(
-                        [
-                            mo.md("#### Dominant defect pattern"),
-                            mo.ui.table(
-                                ev_analysis["defect_table"],
-                                selection=None,
-                                page_size=5,
-                            ),
-                        ],
-                        gap=0.5,
-                    ),
-                ],
-                widths=[1.25, 0.75],
-                gap=1.0,
-                wrap=True,
-                align="stretch",
+            panel(
+                "Supporting lot evidence",
+                mo.ui.table(
+                    ev_analysis["affected_lots"], selection=None, page_size=4
+                ),
+            ),
+            panel(
+                "Dominant defect pattern",
+                mo.ui.table(
+                    ev_analysis["defect_table"], selection=None, page_size=4
+                ),
             ),
         ],
-        gap=0.8,
+        gap=1.0,
     )
 
-    model_view = mo.vstack(
+    predictive_quality_view = mo.vstack(
         [
             mo.md(
                 f"""
-                ### Model summary
+                ### Predictive quality
 
-                - EV quality model average precision: **{ev_analysis["metrics"]["average_precision"]:.2f}**
-                - EV quality model ROC AUC: **{ev_analysis["metrics"]["roc_auc"]:.2f}**
-                - Metro maintenance uses **COMP-aware** anomaly scoring (idle periods dampened) with **data-driven** risk thresholds (P90={metro_analysis["rul_info"]["risk_threshold"]:.0f}).
-                - Degradation trends fitted via linear regression on running-period sensor data.
-                - RUL estimated as weakest-link across per-sensor time-to-nominal-boundary.
-                - In demo mode, downstream vehicle, dealer, and sale-status fields are simulated so the containment workflow remains fully reviewable.
+                This is the sister capability to predictive maintenance. Instead of waiting for bad lots to surface at the end of inspection, the notebook shows which process signatures are drifting away from healthy operating conditions.
                 """
             ),
             mo.hstack(
-                [ev_analysis["importance_fig"], ev_analysis["hotspot_fig"]],
+                [
+                    ev_analysis["process_drift_fig"],
+                    ev_analysis["quality_control_fig"],
+                ],
                 widths="equal",
                 gap=1.0,
                 wrap=True,
                 align="stretch",
             ),
+            mo.hstack(
+                [ev_analysis["fingerprint_fig"], ev_analysis["importance_fig"]],
+                widths="equal",
+                gap=1.0,
+                wrap=True,
+                align="stretch",
+            ),
+            panel(
+                "Lead indicators before lot failure",
+                mo.ui.table(
+                    ev_analysis["lead_indicator_table"],
+                    selection=None,
+                    page_size=6,
+                ),
+            ),
+            panel(
+                "Predictive quality summary",
+                mo.ui.table(
+                    ev_analysis["predictive_quality_summary"],
+                    selection=None,
+                    page_size=4,
+                ),
+            ),
         ],
-        gap=0.8,
+        gap=1.0,
     )
 
     recommendations = mo.md(
@@ -2406,21 +3250,21 @@ def _(ev_analysis, metro_analysis, mo, pd):
         ### Operational recommendations
 
         1. **Maintenance timing:** schedule maintenance at **{metro_analysis["schedule"]["optimal_hour"]}h** (window: {metro_analysis["maintenance_window"]}). Current urgency is **{metro_analysis["risk_score"]:.0f}/100**.
-        2. **Containment:** treat lot **{ev_analysis["containment_summary"]["affected_lot"]}** as the active containment lot. Hold **{ev_analysis["containment_summary"]["dealer_hold_count"]}** unsold vehicles at dealers and issue urgent recall / inspection for **{ev_analysis["containment_summary"]["recall_count"]}** sold vehicles.
-        3. **Demo narrative:** explain the lot tab in three beats only: source lot, impact split, action queue.
-        4. **Customer action:** show how this same pattern extends from predictive maintenance into downstream quality containment and service execution.
-        5. **Enterprise next step:** connect real VIN, dealer inventory, and service campaign data so this workflow moves from demo containment to production execution.
+        2. **Early warning:** communicate that the system surfaces a **{metro_analysis["warning_profile"]["state"]}** signal with **{metro_analysis["warning_profile"]["warning_horizon_hours"]}h** of advance warning before the machine enters the intervention boundary.
+        3. **Portfolio triage:** prioritize **{metro_analysis["high_priority_count"]}** immediate maintenance items first, then **{metro_analysis["next_shift_count"]}** plan-next-shift items from the backlog board.
+        4. **Failure explanation:** explain the maintenance issue through the top precursor chain, starting with **{metro_analysis["incident_card"]["title"]}** and the driver ladder in the failure-progression tab.
+        5. **Enterprise extension:** use the lot genealogy and predictive-quality tabs to show that the same stack can move from machine health to process health to downstream containment actions.
         """
     )
 
     app_tabs = mo.ui.tabs(
         {
             "Executive overview": executive_view,
-            "MetroPT-3 maintenance": metro_view,
-            "Maintenance schedule": schedule_view,
-            "Asset usability": usability_view,
+            "Fleet maintenance": fleet_view,
+            "Failure progression": failure_view,
+            "Maintenance economics": maintenance_econ_view,
             "Lot genealogy": genealogy_view,
-            "Risk drivers": model_view,
+            "Predictive quality": predictive_quality_view,
             "Recommendations": recommendations,
         },
         value="Executive overview",
