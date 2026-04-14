@@ -13,7 +13,7 @@
 
 import marimo
 
-__generated_with = "0.22.5"
+__generated_with = "0.23.1"
 app = marimo.App(width="full")
 
 
@@ -56,7 +56,6 @@ def _():
         make_subplots,
         mo,
         np,
-        nx,
         pd,
         px,
         roc_auc_score,
@@ -77,7 +76,6 @@ def _(
     go,
     make_subplots,
     np,
-    nx,
     pd,
     px,
     roc_auc_score,
@@ -935,10 +933,18 @@ def _(
         suppliers = ["Supplier-A", "Supplier-B", "Supplier-C"]
         lines = ["Line-1", "Line-2", "Line-3"]
         shifts = ["Day", "Swing", "Night"]
+        dealers = [
+            ("Zeus Austin", "US-South"),
+            ("Zeus Fremont", "US-West"),
+            ("Zeus Phoenix", "US-West"),
+            ("Zeus Newark", "US-East"),
+            ("Zeus Chicago", "US-Central"),
+        ]
         batches = [f"BATCH-{idx:03d}" for idx in range(1, 61)]
         rows = []
 
         for batch in batches:
+            batch_num = int(batch.split("-")[-1])
             supplier = suppliers[rng.integers(0, len(suppliers))]
             line = lines[rng.integers(0, len(lines))]
             shift = shifts[rng.integers(0, len(shifts))]
@@ -951,6 +957,27 @@ def _(
             }[supplier]
 
             for cell_idx in range(80):
+                vehicle_num = cell_idx // 4 + 1
+                dealer_name, market = dealers[
+                    (
+                        batch_num
+                        + vehicle_num
+                        + lines.index(line)
+                        + shifts.index(shift)
+                    )
+                    % len(dealers)
+                ]
+                sale_seed = (
+                    vehicle_num
+                    + batch_num
+                    + lines.index(line) * 2
+                    + shifts.index(shift)
+                )
+                sale_status = "unsold" if sale_seed % 5 < 2 else "sold"
+                action_priority = (
+                    "P1 hold" if sale_status == "unsold" else "P1 recall"
+                )
+
                 ambient = rng.normal(24.8 + temp_shift, 1.8)
                 overhang = rng.normal(1.05 + line_bias * 0.1, 0.08)
                 electrolyte = rng.normal(4.25 - supplier_bias * 0.12, 0.12)
@@ -991,6 +1018,13 @@ def _(
                     {
                         "Cell_ID": f"{batch}-CELL-{cell_idx:03d}",
                         "Batch_ID": batch,
+                        "Lot_ID": batch.replace("BATCH", "LOT"),
+                        "Vehicle_ID": f"{batch}-VIN-{vehicle_num:03d}",
+                        "Dealer_ID": dealer_name,
+                        "Market": market,
+                        "Sale_Status": sale_status,
+                        "Action_Status": "Awaiting containment decision",
+                        "Action_Priority": action_priority,
                         "Supplier": supplier,
                         "Production_Line": line,
                         "Shift": shift,
@@ -1006,6 +1040,84 @@ def _(
                     }
                 )
         return pd.DataFrame(rows)
+
+
+    def ensure_ev_traceability_fields(
+        df, batch_col, supplier_col, line_col, shift_col
+    ):
+        df = df.copy()
+        batch_series = df[batch_col].astype(str)
+        row_order = df.groupby(batch_col).cumcount()
+        vehicle_num = (row_order // 4) + 1
+
+        if "Lot_ID" in df.columns:
+            df["Lot_ID"] = df["Lot_ID"].astype(str)
+        else:
+            df["Lot_ID"] = batch_series.str.replace("BATCH", "LOT", regex=False)
+
+        if "Vehicle_ID" in df.columns:
+            df["Vehicle_ID"] = df["Vehicle_ID"].astype(str)
+        else:
+            df["Vehicle_ID"] = (
+                batch_series + "-VIN-" + vehicle_num.astype(str).str.zfill(3)
+            )
+
+        dealer_catalog = pd.DataFrame(
+            [
+                {"Dealer_ID": "Zeus Austin", "Market": "US-South"},
+                {"Dealer_ID": "Zeus Fremont", "Market": "US-West"},
+                {"Dealer_ID": "Zeus Phoenix", "Market": "US-West"},
+                {"Dealer_ID": "Zeus Newark", "Market": "US-East"},
+                {"Dealer_ID": "Zeus Chicago", "Market": "US-Central"},
+            ]
+        )
+        supplier_code = pd.factorize(df[supplier_col].astype(str))[0]
+        line_code = pd.factorize(df[line_col].astype(str))[0]
+        shift_code = pd.factorize(df[shift_col].astype(str))[0]
+        dealer_idx = (
+            vehicle_num.to_numpy() + supplier_code * 2 + line_code + shift_code
+        ) % len(dealer_catalog)
+
+        if "Dealer_ID" in df.columns:
+            df["Dealer_ID"] = df["Dealer_ID"].astype(str)
+        else:
+            df["Dealer_ID"] = dealer_catalog.iloc[dealer_idx][
+                "Dealer_ID"
+            ].to_numpy()
+
+        if "Market" in df.columns:
+            df["Market"] = df["Market"].astype(str)
+        else:
+            df["Market"] = dealer_catalog.iloc[dealer_idx]["Market"].to_numpy()
+
+        if "Sale_Status" in df.columns:
+            normalized_status = (
+                df["Sale_Status"].astype(str).str.strip().str.lower()
+            )
+            df["Sale_Status"] = np.where(
+                normalized_status.isin(
+                    ["unsold", "inventory", "dealer", "in_stock"]
+                ),
+                "unsold",
+                "sold",
+            )
+        else:
+            sale_seed = vehicle_num.to_numpy() + line_code * 2 + shift_code
+            df["Sale_Status"] = np.where(sale_seed % 5 < 2, "unsold", "sold")
+
+        if "Action_Status" in df.columns:
+            df["Action_Status"] = df["Action_Status"].astype(str)
+        else:
+            df["Action_Status"] = "Awaiting containment decision"
+
+        if "Action_Priority" in df.columns:
+            df["Action_Priority"] = df["Action_Priority"].astype(str)
+        else:
+            df["Action_Priority"] = np.where(
+                df["Sale_Status"].eq("unsold"), "P1 hold", "P1 recall"
+            )
+
+        return df
 
 
     def prepare_ev_dataset():
@@ -1044,6 +1156,14 @@ def _(
                 "defect": "Defect_Type",
             }
 
+        df = ensure_ev_traceability_fields(
+            df,
+            batch_col=required["batch"],
+            supplier_col=required["supplier"],
+            line_col=required["line"],
+            shift_col=required["shift"],
+        )
+
         return {
             "df": df,
             "mode": mode,
@@ -1054,6 +1174,13 @@ def _(
             "shift_col": required["shift"],
             "grade_col": required["grade"],
             "defect_col": required["defect"],
+            "lot_col": "Lot_ID",
+            "vehicle_col": "Vehicle_ID",
+            "dealer_col": "Dealer_ID",
+            "sale_status_col": "Sale_Status",
+            "market_col": "Market",
+            "action_status_col": "Action_Status",
+            "action_priority_col": "Action_Priority",
         }
 
 
@@ -1166,98 +1293,146 @@ def _(
         return df, metrics, importance_df
 
 
-    def lineage_figure(
-        batch_rows, supplier_col, line_col, shift_col, batch_col, grade_col
-    ):
-        if batch_rows.empty:
+    def lineage_figure(vehicle_actions, lot_col):
+        if vehicle_actions.empty:
             return go.Figure()
 
-        graph = nx.DiGraph()
-        for _, row in batch_rows.iterrows():
-            graph.add_edge(row[supplier_col], row[line_col])
-            graph.add_edge(row[line_col], row[shift_col])
-            graph.add_edge(row[shift_col], row[batch_col])
-            graph.add_edge(row[batch_col], row[grade_col])
+        flow = vehicle_actions[
+            ["supplier", "line", "shift", lot_col, "containment_cluster"]
+        ].copy()
+        layer_specs = [
+            ("supplier", "Supplier", "#315c72"),
+            ("line", "Line", "#8aa1af"),
+            ("shift", "Shift", "#cf8f3d"),
+            (lot_col, "Lot", "#475569"),
+            ("containment_cluster", "Action", None),
+        ]
 
-        node_layers = {
-            "supplier": sorted(
-                batch_rows[supplier_col].astype(str).unique().tolist()
-            ),
-            "line": sorted(batch_rows[line_col].astype(str).unique().tolist()),
-            "shift": sorted(batch_rows[shift_col].astype(str).unique().tolist()),
-            "batch": sorted(batch_rows[batch_col].astype(str).unique().tolist()),
-            "grade": sorted(batch_rows[grade_col].astype(str).unique().tolist()),
-        }
-        x_positions = {
-            "supplier": 0.05,
-            "line": 0.28,
-            "shift": 0.5,
-            "batch": 0.72,
-            "grade": 0.94,
-        }
+        node_index = {}
+        labels = []
+        colors = []
 
-        coords = {}
-        node_text = {}
-        layer_palette = {
-            "supplier": "#315c72",
-            "line": "#8aa1af",
-            "shift": "#cf8f3d",
-            "batch": "#6b7280",
-            "grade": "#b45309",
-        }
-        for layer_name, nodes in node_layers.items():
-            for idx, node in enumerate(nodes):
-                y = 1 - (idx + 1) / (len(nodes) + 1)
-                coords[node] = (x_positions[layer_name], y)
-                node_text[node] = layer_name.title()
+        def _cluster_color(value):
+            return "#cf8f3d" if "Unsold" in value else "#b91c1c"
 
-        edge_x = []
-        edge_y = []
-        for source, target in graph.edges():
-            x0, y0 = coords[source]
-            x1, y1 = coords[target]
-            edge_x.extend([x0, x1, None])
-            edge_y.extend([y0, y1, None])
+        for column, title, color in layer_specs:
+            values = flow[column].astype(str).drop_duplicates().tolist()
+            for value in values:
+                node_index[(column, value)] = len(labels)
+                labels.append(title + "\n" + value)
+                colors.append(color or _cluster_color(value))
+
+        sources = []
+        targets = []
+        values = []
+        link_colors = []
+        transitions = [
+            ("supplier", "line"),
+            ("line", "shift"),
+            ("shift", lot_col),
+            (lot_col, "containment_cluster"),
+        ]
+        for source_col, target_col in transitions:
+            grouped = (
+                flow.groupby([source_col, target_col])
+                .size()
+                .reset_index(name="count")
+            )
+            for _, row in grouped.iterrows():
+                target_value = str(row[target_col])
+                sources.append(node_index[(source_col, str(row[source_col]))])
+                targets.append(node_index[(target_col, target_value)])
+                values.append(int(row["count"]))
+                if target_col == "containment_cluster":
+                    link_colors.append(
+                        "rgba(207, 143, 61, 0.35)"
+                        if "Unsold" in target_value
+                        else "rgba(185, 28, 28, 0.30)"
+                    )
+                else:
+                    link_colors.append("rgba(49, 92, 114, 0.16)")
+
+        fig = go.Figure(
+            go.Sankey(
+                arrangement="snap",
+                node={
+                    "pad": 20,
+                    "thickness": 18,
+                    "line": {"color": "rgba(255,255,255,0.9)", "width": 1},
+                    "label": labels,
+                    "color": colors,
+                },
+                link={
+                    "source": sources,
+                    "target": targets,
+                    "value": values,
+                    "color": link_colors,
+                },
+            )
+        )
+        fig.update_layout(
+            height=380,
+            margin={"l": 20, "r": 20, "t": 42, "b": 20},
+            paper_bgcolor="#f5f7f9",
+            font={"size": 13, "color": "#13212b"},
+            title="Containment flow from source lot to field action",
+        )
+        return fig
+
+
+    def impact_split_figure(containment_actions):
+        if containment_actions.empty:
+            return go.Figure()
+
+        values = containment_actions["Vehicle count"].astype(int).tolist()
+        labels = containment_actions["Cluster"].tolist()
+        colors = ["#cf8f3d", "#b91c1c"]
+        total = max(sum(values), 1)
 
         fig = go.Figure()
         fig.add_trace(
-            go.Scatter(
-                x=edge_x,
-                y=edge_y,
-                mode="lines",
-                line={"color": "#cbd5db", "width": 2},
-                hoverinfo="none",
-                showlegend=False,
+            go.Bar(
+                y=["Impacted vehicles"],
+                x=[values[0]],
+                orientation="h",
+                name=labels[0],
+                marker={"color": colors[0]},
+                text=[f"{values[0]} hold"],
+                textposition="inside",
+                insidetextanchor="middle",
             )
         )
-
-        for layer_name, nodes in node_layers.items():
-            fig.add_trace(
-                go.Scatter(
-                    x=[coords[node][0] for node in nodes],
-                    y=[coords[node][1] for node in nodes],
-                    mode="markers+text",
-                    text=nodes,
-                    textposition="top center",
-                    marker={
-                        "size": 18,
-                        "color": layer_palette[layer_name],
-                        "line": {"color": "#ffffff", "width": 1.5},
-                    },
-                    name=layer_name.title(),
-                    hovertext=[f"{layer_name.title()}: {node}" for node in nodes],
-                    hoverinfo="text",
-                )
+        fig.add_trace(
+            go.Bar(
+                y=["Impacted vehicles"],
+                x=[values[1]],
+                orientation="h",
+                name=labels[1],
+                marker={"color": colors[1]},
+                text=[f"{values[1]} recall"],
+                textposition="inside",
+                insidetextanchor="middle",
             )
-
+        )
         fig.update_layout(
+            barmode="stack",
             height=380,
-            margin={"l": 20, "r": 20, "t": 40, "b": 20},
+            margin={"l": 20, "r": 20, "t": 42, "b": 20},
             paper_bgcolor="#f5f7f9",
             plot_bgcolor="#ffffff",
-            title="Lot genealogy view",
-            xaxis={"visible": False},
-            yaxis={"visible": False},
+            title="Downstream impact split",
+            legend={"orientation": "h", "y": 1.12},
+        )
+        fig.update_xaxes(title_text="Vehicle count", range=[0, total])
+        fig.add_annotation(
+            x=total,
+            y=0,
+            text=f"Total impacted: {total}",
+            showarrow=False,
+            xanchor="right",
+            yanchor="bottom",
+            yshift=26,
+            font={"size": 13, "color": "#13212b"},
         )
         return fig
 
@@ -1270,6 +1445,11 @@ def _(
         batch_col = ev_state["batch_col"]
         grade_col = ev_state["grade_col"]
         defect_col = ev_state["defect_col"]
+        lot_col = ev_state["lot_col"]
+        vehicle_col = ev_state["vehicle_col"]
+        dealer_col = ev_state["dealer_col"]
+        sale_status_col = ev_state["sale_status_col"]
+        market_col = ev_state["market_col"]
 
         filtered = modeled_df.copy()
         if selected_supplier != "All":
@@ -1284,6 +1464,30 @@ def _(
             filtered = filtered.loc[
                 filtered[batch_col].astype(str) == selected_batch
             ]
+        if filtered.empty:
+            filtered = modeled_df.copy()
+
+        def _cluster_vehicle_count(values, target_status):
+            rows = filtered.loc[
+                values.index, [vehicle_col, sale_status_col]
+            ].copy()
+            status = rows[sale_status_col].astype(str).str.lower()
+            return int(
+                rows.loc[status == target_status, vehicle_col]
+                .astype(str)
+                .nunique()
+            )
+
+        def _worst_grade(values):
+            rank = {"Grade A": 0, "Grade B": 1, "Scrap": 2}
+            values = values.astype(str)
+            return max(values, key=lambda value: rank.get(value, 0))
+
+        def _dominant_defect(values):
+            cleaned = values.astype(str).replace("None", np.nan).dropna()
+            if cleaned.empty:
+                return "No defect observed"
+            return cleaned.value_counts().index[0]
 
         qc_mix = (
             filtered.groupby(grade_col)
@@ -1304,13 +1508,26 @@ def _(
             .sort_values("avg_risk", ascending=False)
         )
         batch_summary = (
-            modeled_df.groupby(batch_col)
+            filtered.groupby(batch_col)
             .agg(
+                lot_id=(lot_col, "first"),
                 supplier=(supplier_col, "first"),
                 line=(line_col, "first"),
                 shift=(shift_col, "first"),
                 avg_risk=("predicted_risk", "mean"),
                 scrap_share=(grade_col, lambda values: (values == "Scrap").mean()),
+                impacted_vehicle_count=(
+                    vehicle_col,
+                    lambda values: values.astype(str).nunique(),
+                ),
+                dealer_hold_count=(
+                    vehicle_col,
+                    lambda values: _cluster_vehicle_count(values, "unsold"),
+                ),
+                recall_count=(
+                    vehicle_col,
+                    lambda values: _cluster_vehicle_count(values, "sold"),
+                ),
             )
             .reset_index()
             .sort_values(["avg_risk", "scrap_share"], ascending=False)
@@ -1319,9 +1536,53 @@ def _(
         focus_batch = selected_batch
         if focus_batch == "All":
             focus_batch = str(batch_summary.iloc[0][batch_col])
-        focus_rows = modeled_df.loc[
-            modeled_df[batch_col].astype(str) == focus_batch
+        focus_rows = filtered.loc[
+            filtered[batch_col].astype(str) == focus_batch
         ].copy()
+
+        vehicle_actions = (
+            focus_rows.groupby(
+                [lot_col, vehicle_col, dealer_col, market_col, sale_status_col],
+                as_index=False,
+            )
+            .agg(
+                supplier=(supplier_col, "first"),
+                line=(line_col, "first"),
+                shift=(shift_col, "first"),
+                avg_risk=("predicted_risk", "mean"),
+                peak_cell_risk=("predicted_risk", "max"),
+                worst_grade=(grade_col, _worst_grade),
+                dominant_defect=(defect_col, _dominant_defect),
+            )
+            .sort_values("avg_risk", ascending=False)
+        )
+        vehicle_actions[sale_status_col] = (
+            vehicle_actions[sale_status_col].astype(str).str.lower()
+        )
+        vehicle_actions["containment_cluster"] = np.where(
+            vehicle_actions[sale_status_col].eq("unsold"),
+            "Unsold dealer inventory",
+            "Sold vehicles requiring recall",
+        )
+        vehicle_actions["recommended_action"] = np.where(
+            vehicle_actions[sale_status_col].eq("unsold"),
+            "Place dealer hold and quarantine inventory",
+            "Issue recall and route vehicle to urgent inspection",
+        )
+        vehicle_actions["Action_Status"] = np.where(
+            vehicle_actions[sale_status_col].eq("unsold"),
+            "Ready to notify dealer operations",
+            "Ready to notify owners and field service",
+        )
+        vehicle_actions["Action_Priority"] = np.where(
+            vehicle_actions[sale_status_col].eq("unsold"),
+            "P1 hold",
+            "P1 recall",
+        )
+        vehicle_actions["avg_risk"] = vehicle_actions["avg_risk"].round(2)
+        vehicle_actions["peak_cell_risk"] = vehicle_actions[
+            "peak_cell_risk"
+        ].round(2)
 
         qc_fig = px.pie(
             qc_mix,
@@ -1376,26 +1637,188 @@ def _(
             coloraxis_showscale=False,
         )
 
-        lineage_fig = lineage_figure(
-            focus_rows[
-                [supplier_col, line_col, shift_col, batch_col, grade_col]
-            ].drop_duplicates(),
-            supplier_col,
-            line_col,
-            shift_col,
-            batch_col,
-            grade_col,
-        )
+        lineage_fig = lineage_figure(vehicle_actions, lot_col)
 
         top_batch = batch_summary.iloc[0]
         defect_view = (
             focus_rows.groupby(defect_col)
             .size()
-            .reset_index(name="cells")
-            .sort_values("cells", ascending=False)
+            .reset_index(name="Affected cells")
+            .sort_values("Affected cells", ascending=False)
             .head(5)
         )
         defect_table = defect_view.rename(columns={defect_col: "Defect"})
+
+        affected_lots = (
+            batch_summary.head(5)
+            .rename(
+                columns={
+                    batch_col: "Batch",
+                    "lot_id": "Lot",
+                    "supplier": "Supplier",
+                    "line": "Line",
+                    "shift": "Shift",
+                    "avg_risk": "Avg risk",
+                    "scrap_share": "Scrap share",
+                    "impacted_vehicle_count": "Vehicles",
+                    "dealer_hold_count": "Dealer hold",
+                    "recall_count": "Recall",
+                }
+            )
+            .copy()
+        )
+        affected_lots["Avg risk"] = affected_lots["Avg risk"].round(2)
+        affected_lots["Scrap share"] = (
+            affected_lots["Scrap share"]
+            .mul(100)
+            .round(1)
+            .map(lambda value: f"{value:.1f}%")
+        )
+
+        dealer_hold_table = (
+            vehicle_actions.loc[
+                vehicle_actions[sale_status_col].eq("unsold"),
+                [
+                    vehicle_col,
+                    dealer_col,
+                    market_col,
+                    "avg_risk",
+                    "worst_grade",
+                    "dominant_defect",
+                    "recommended_action",
+                    "Action_Status",
+                ],
+            ]
+            .rename(
+                columns={
+                    vehicle_col: "Vehicle ID",
+                    dealer_col: "Dealer",
+                    market_col: "Market",
+                    "avg_risk": "Avg risk",
+                    "worst_grade": "Worst grade",
+                    "dominant_defect": "Likely defect",
+                    "recommended_action": "Action",
+                    "Action_Status": "Action status",
+                }
+            )
+            .reset_index(drop=True)
+        )
+
+        recall_table = (
+            vehicle_actions.loc[
+                vehicle_actions[sale_status_col].eq("sold"),
+                [
+                    vehicle_col,
+                    dealer_col,
+                    market_col,
+                    "avg_risk",
+                    "worst_grade",
+                    "dominant_defect",
+                    "recommended_action",
+                    "Action_Status",
+                ],
+            ]
+            .rename(
+                columns={
+                    vehicle_col: "Vehicle ID",
+                    dealer_col: "Origin dealer",
+                    market_col: "Market",
+                    "avg_risk": "Avg risk",
+                    "worst_grade": "Worst grade",
+                    "dominant_defect": "Likely defect",
+                    "recommended_action": "Action",
+                    "Action_Status": "Action status",
+                }
+            )
+            .reset_index(drop=True)
+        )
+
+        containment_actions = pd.DataFrame(
+            [
+                {
+                    "Cluster": "Unsold vehicles on dealer lots",
+                    "Vehicle count": int(dealer_hold_table.shape[0]),
+                    "Recommended action": "Send dealer hold notice and quarantine inventory",
+                    "Owner": "Dealer operations",
+                    "Priority": "P1 hold",
+                },
+                {
+                    "Cluster": "Sold vehicles requiring recall",
+                    "Vehicle count": int(recall_table.shape[0]),
+                    "Recommended action": "Launch recall / urgent inspection campaign",
+                    "Owner": "Field service + customer care",
+                    "Priority": "P1 recall",
+                },
+            ]
+        )
+
+        action_queue = (
+            vehicle_actions[
+                [
+                    "containment_cluster",
+                    "Action_Priority",
+                    vehicle_col,
+                    dealer_col,
+                    market_col,
+                    "avg_risk",
+                    "worst_grade",
+                    "dominant_defect",
+                    "recommended_action",
+                    "Action_Status",
+                ]
+            ]
+            .rename(
+                columns={
+                    "containment_cluster": "Cluster",
+                    vehicle_col: "Vehicle ID",
+                    dealer_col: "Dealer",
+                    market_col: "Market",
+                    "avg_risk": "Avg risk",
+                    "worst_grade": "Worst grade",
+                    "dominant_defect": "Likely defect",
+                    "recommended_action": "Action",
+                    "Action_Status": "Action status",
+                    "Action_Priority": "Priority",
+                }
+            )
+            .copy()
+        )
+        action_queue["cluster_order"] = np.where(
+            action_queue["Cluster"].eq("Unsold dealer inventory"), 0, 1
+        )
+        action_queue = action_queue.sort_values(
+            ["cluster_order", "Avg risk"], ascending=[True, False]
+        ).drop(columns=["cluster_order"])
+
+        dominant_defect = (
+            str(defect_table.iloc[0]["Defect"])
+            if not defect_table.empty
+            else "No defect observed"
+        )
+        worst_grade = (
+            str(vehicle_actions["worst_grade"].iloc[0])
+            if not vehicle_actions.empty
+            else "Grade A"
+        )
+        focus_supplier = str(focus_rows[supplier_col].iloc[0])
+        focus_line = str(focus_rows[line_col].iloc[0])
+        focus_shift = str(focus_rows[shift_col].iloc[0])
+        focus_lot = str(focus_rows[lot_col].iloc[0])
+        containment_summary = {
+            "affected_lot": focus_lot,
+            "supplier": focus_supplier,
+            "line": focus_line,
+            "shift": focus_shift,
+            "impacted_vehicle_count": int(vehicle_actions.shape[0]),
+            "dealer_hold_count": int(dealer_hold_table.shape[0]),
+            "recall_count": int(recall_table.shape[0]),
+            "avg_risk": round(float(focus_rows["predicted_risk"].mean()), 2),
+            "dominant_defect": dominant_defect,
+            "worst_grade": worst_grade,
+            "business_action": "Hold unsold dealer inventory now and issue urgent recall / inspection for sold vehicles.",
+        }
+
+        impact_fig = impact_split_figure(containment_actions)
 
         return {
             "modeled_df": modeled_df,
@@ -1404,10 +1827,17 @@ def _(
             "hotspot_fig": hotspot_fig,
             "importance_fig": importance_fig,
             "lineage_fig": lineage_fig,
+            "impact_fig": impact_fig,
             "batch_summary": batch_summary,
             "top_batch": top_batch,
             "focus_batch": focus_batch,
             "defect_table": defect_table,
+            "affected_lots": affected_lots,
+            "dealer_hold_table": dealer_hold_table,
+            "recall_table": recall_table,
+            "containment_actions": containment_actions,
+            "action_queue": action_queue,
+            "containment_summary": containment_summary,
         }
 
 
@@ -1467,14 +1897,14 @@ def _(NOTEBOOK_DATE, mo):
         f"""
         <section class="pm-hero">
           <div style="font-size:0.86rem; letter-spacing:0.08em; text-transform:uppercase;">
-            Predictive Maintenance Intelligence
+            Enterprise Traceability + Predictive Maintenance
           </div>
           <h1 style="margin:0.35rem 0 0; font-size:2rem;">
-            Maintenance + genealogy command center
+            Operational command center for maintenance and containment
           </h1>
           <p>
-            A professional marimo app for maintenance timing, asset health, and lot
-            traceability. Refreshed with Kaggle notebook inspiration reviewed on
+            Identify the affected lot, trace downstream exposure, separate unsold from sold units,
+            and trigger the right field action alongside maintenance decisions. Refreshed on
             {NOTEBOOK_DATE}.
           </p>
         </section>
@@ -1502,8 +1932,8 @@ def _(ev_state, metro_state, mo):
 
             - {metro_note}
             - {ev_note}
-            - The app still runs end-to-end in demo mode so the executive story and
-              visual design stay reviewable before data onboarding.
+            - Demo mode now simulates lot-to-vehicle, dealer, and sale-status mappings so the containment workflow stays reviewable before downstream system onboarding.
+            - This keeps the hold-versus-recall story visible even when real inventory and service data are not yet connected.
             """
         ),
         kind="info",
@@ -1573,7 +2003,9 @@ def _(ev_state, line_picker, mo, supplier_picker):
             filtered[ev_state["line_col"]].astype(str) == line_picker.value
         ]
 
-    batches = ["All"] + sorted(filtered[ev_state["batch_col"]].astype(str).unique().tolist())
+    batches = ["All"] + sorted(
+        filtered[ev_state["batch_col"]].astype(str).unique().tolist()
+    )
     batch_picker = mo.ui.dropdown(
         batches,
         value="All",
@@ -1582,7 +2014,7 @@ def _(ev_state, line_picker, mo, supplier_picker):
     )
     mo.hstack(
         [
-            mo.md("### Genealogy focus"),
+            mo.md("### Containment focus"),
             batch_picker,
         ],
         widths=[1, 2],
@@ -1635,15 +2067,21 @@ def _(ev_analysis, metro_analysis, mo):
                 bordered=True,
             ),
             mo.stat(
-                value=f"{metro_analysis['usability']['composite_pct']:.0f}%",
-                label="asset usability",
-                caption=f"weakest: {metro_analysis['usability']['weakest_sensor']}",
+                value=ev_analysis["containment_summary"]["affected_lot"],
+                label="affected lot",
+                caption=f"{ev_analysis['containment_summary']['supplier']} / {ev_analysis['containment_summary']['line']}",
                 bordered=True,
             ),
             mo.stat(
-                value=f"{ev_analysis['top_batch']['avg_risk']:.2f}",
-                label="highest batch risk",
-                caption=ev_analysis["focus_batch"],
+                value=str(ev_analysis["containment_summary"]["dealer_hold_count"]),
+                label="dealer hold units",
+                caption="unsold inventory to quarantine",
+                bordered=True,
+            ),
+            mo.stat(
+                value=str(ev_analysis["containment_summary"]["recall_count"]),
+                label="recall units",
+                caption="sold vehicles needing urgent inspection",
                 bordered=True,
             ),
         ],
@@ -1676,6 +2114,103 @@ def _(ROOT, mo):
 
 @app.cell(hide_code=True)
 def _(ev_analysis, metro_analysis, mo, pd):
+    lot_summary = mo.Html(
+        f"""
+        <style>
+          .pm-lot-grid {{
+            display: grid;
+            grid-template-columns: minmax(240px, 1.4fr) repeat(5, minmax(120px, 1fr));
+            gap: 12px;
+            margin-bottom: 0.2rem;
+          }}
+          .pm-lot-hero, .pm-lot-stat {{
+            border-radius: 18px;
+            border: 1px solid #dbe3e8;
+            background: #ffffff;
+            box-shadow: 0 10px 22px rgba(49, 92, 114, 0.08);
+          }}
+          .pm-lot-hero {{
+            padding: 16px 18px;
+            background: linear-gradient(135deg, #13212b 0%, #315c72 62%, #8aa1af 100%);
+            color: #ffffff;
+          }}
+          .pm-lot-hero .eyebrow {{
+            font-size: 0.76rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            opacity: 0.82;
+          }}
+          .pm-lot-hero h3 {{
+            margin: 0.35rem 0 0.2rem;
+            font-size: 1.45rem;
+          }}
+          .pm-lot-hero p {{
+            margin: 0.2rem 0;
+            line-height: 1.35;
+            color: rgba(255,255,255,0.88);
+          }}
+          .pm-lot-stat {{
+            padding: 14px 16px;
+          }}
+          .pm-lot-stat .label {{
+            color: #5a6b76;
+            font-size: 0.82rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+          }}
+          .pm-lot-stat .value {{
+            margin-top: 0.35rem;
+            font-size: 1.45rem;
+            font-weight: 700;
+            color: #13212b;
+          }}
+          .pm-lot-stat .caption {{
+            margin-top: 0.15rem;
+            color: #5a6b76;
+            font-size: 0.92rem;
+          }}
+          @media (max-width: 1100px) {{
+            .pm-lot-grid {{
+              grid-template-columns: repeat(2, minmax(180px, 1fr));
+            }}
+          }}
+        </style>
+        <div class="pm-lot-grid">
+          <div class="pm-lot-hero">
+            <div class="eyebrow">Active containment case</div>
+            <h3>{ev_analysis["containment_summary"]["affected_lot"]}</h3>
+            <p>{ev_analysis["containment_summary"]["supplier"]} / {ev_analysis["containment_summary"]["line"]} / {ev_analysis["containment_summary"]["shift"]}</p>
+            <p>{ev_analysis["containment_summary"]["business_action"]}</p>
+          </div>
+          <div class="pm-lot-stat">
+            <div class="label">Impacted vehicles</div>
+            <div class="value">{ev_analysis["containment_summary"]["impacted_vehicle_count"]}</div>
+            <div class="caption">Downstream population traced</div>
+          </div>
+          <div class="pm-lot-stat">
+            <div class="label">Dealer hold</div>
+            <div class="value">{ev_analysis["containment_summary"]["dealer_hold_count"]}</div>
+            <div class="caption">Unsold units to quarantine</div>
+          </div>
+          <div class="pm-lot-stat">
+            <div class="label">Recall</div>
+            <div class="value">{ev_analysis["containment_summary"]["recall_count"]}</div>
+            <div class="caption">Sold units needing inspection</div>
+          </div>
+          <div class="pm-lot-stat">
+            <div class="label">Average risk</div>
+            <div class="value">{ev_analysis["containment_summary"]["avg_risk"]:.2f}</div>
+            <div class="caption">Predicted lot-level severity</div>
+          </div>
+          <div class="pm-lot-stat">
+            <div class="label">Dominant defect</div>
+            <div class="value" style="font-size:1.05rem; line-height:1.25;">{ev_analysis["containment_summary"]["dominant_defect"]}</div>
+            <div class="caption">Worst observed grade: {ev_analysis["containment_summary"]["worst_grade"]}</div>
+          </div>
+        </div>
+        """
+    )
+
     executive_view = mo.vstack(
         [
             mo.md(
@@ -1684,12 +2219,40 @@ def _(ev_analysis, metro_analysis, mo, pd):
 
                 - **Maintenance posture:** {metro_analysis["recommendation"]} for the selected asset, with an action window of **{metro_analysis["maintenance_window"]}**.
                 - **Remaining useful life:** estimated at **{metro_analysis["rul_info"]["composite_rul_hours"]}h**, limited by **{metro_analysis["rul_info"]["weakest_sensor"]}**. Optimal maintenance at **{metro_analysis["schedule"]["optimal_hour"]}h**.
-                - **Asset usability:** operating at **{metro_analysis["usability"]["composite_pct"]:.0f}%** of design envelope.
-                - **Lot genealogy posture:** batch **{ev_analysis["focus_batch"]}** is the current focus lot, and supplier / line patterns indicate where defect containment should tighten first.
+                - **Containment posture:** lot **{ev_analysis["containment_summary"]["affected_lot"]}** from **{ev_analysis["containment_summary"]["supplier"]} / {ev_analysis["containment_summary"]["line"]} / {ev_analysis["containment_summary"]["shift"]}** is the active field-action lot.
+                - **Downstream exposure:** **{ev_analysis["containment_summary"]["impacted_vehicle_count"]}** vehicles traced so far: **{ev_analysis["containment_summary"]["dealer_hold_count"]}** unsold units still on dealer lots and **{ev_analysis["containment_summary"]["recall_count"]}** sold units needing urgent inspection.
+                - **Business action:** {ev_analysis["containment_summary"]["business_action"]}
                 """
             ),
-            mo.ui.table(
-                metro_analysis["action_table"], selection=None, page_size=5
+            mo.hstack(
+                [
+                    mo.vstack(
+                        [
+                            mo.md("#### Maintenance actions"),
+                            mo.ui.table(
+                                metro_analysis["action_table"],
+                                selection=None,
+                                page_size=5,
+                            ),
+                        ],
+                        gap=0.5,
+                    ),
+                    mo.vstack(
+                        [
+                            mo.md("#### Field actions"),
+                            mo.ui.table(
+                                ev_analysis["containment_actions"],
+                                selection=None,
+                                page_size=5,
+                            ),
+                        ],
+                        gap=0.5,
+                    ),
+                ],
+                widths="equal",
+                gap=1.0,
+                wrap=True,
+                align="stretch",
             ),
         ],
         gap=0.8,
@@ -1755,15 +2318,60 @@ def _(ev_analysis, metro_analysis, mo, pd):
 
     genealogy_view = mo.vstack(
         [
+            mo.md(
+                f"""
+                ### Lot genealogy and containment
+
+                This page is now structured as a client demo narrative: the incident is summarized first, the source-to-action flow is visualized second, and the operational queue comes last.
+                """
+            ),
+            lot_summary,
             mo.hstack(
-                [ev_analysis["qc_fig"], ev_analysis["hotspot_fig"]],
-                widths="equal",
+                [ev_analysis["lineage_fig"], ev_analysis["impact_fig"]],
+                widths=[1.8, 1],
                 gap=1.0,
                 wrap=True,
                 align="stretch",
             ),
-            ev_analysis["lineage_fig"],
-            mo.ui.table(ev_analysis["defect_table"], selection=None, page_size=5),
+            mo.vstack(
+                [
+                    mo.md("#### Operational action queue"),
+                    mo.ui.table(
+                        ev_analysis["action_queue"], selection=None, page_size=10
+                    ),
+                ],
+                gap=0.5,
+            ),
+            mo.hstack(
+                [
+                    mo.vstack(
+                        [
+                            mo.md("#### Supporting lot evidence"),
+                            mo.ui.table(
+                                ev_analysis["affected_lots"],
+                                selection=None,
+                                page_size=5,
+                            ),
+                        ],
+                        gap=0.5,
+                    ),
+                    mo.vstack(
+                        [
+                            mo.md("#### Dominant defect pattern"),
+                            mo.ui.table(
+                                ev_analysis["defect_table"],
+                                selection=None,
+                                page_size=5,
+                            ),
+                        ],
+                        gap=0.5,
+                    ),
+                ],
+                widths=[1.25, 0.75],
+                gap=1.0,
+                wrap=True,
+                align="stretch",
+            ),
         ],
         gap=0.8,
     )
@@ -1779,9 +2387,16 @@ def _(ev_analysis, metro_analysis, mo, pd):
                 - Metro maintenance uses **COMP-aware** anomaly scoring (idle periods dampened) with **data-driven** risk thresholds (P90={metro_analysis["rul_info"]["risk_threshold"]:.0f}).
                 - Degradation trends fitted via linear regression on running-period sensor data.
                 - RUL estimated as weakest-link across per-sensor time-to-nominal-boundary.
+                - In demo mode, downstream vehicle, dealer, and sale-status fields are simulated so the containment workflow remains fully reviewable.
                 """
             ),
-            ev_analysis["importance_fig"],
+            mo.hstack(
+                [ev_analysis["importance_fig"], ev_analysis["hotspot_fig"]],
+                widths="equal",
+                gap=1.0,
+                wrap=True,
+                align="stretch",
+            ),
         ],
         gap=0.8,
     )
@@ -1791,9 +2406,10 @@ def _(ev_analysis, metro_analysis, mo, pd):
         ### Operational recommendations
 
         1. **Maintenance timing:** schedule maintenance at **{metro_analysis["schedule"]["optimal_hour"]}h** (window: {metro_analysis["maintenance_window"]}). Current urgency is **{metro_analysis["risk_score"]:.0f}/100**.
-        2. **Asset life:** RUL is **{metro_analysis["rul_info"]["composite_rul_hours"]}h**, limited by {metro_analysis["rul_info"]["weakest_sensor"]}. Monitor this sensor closely for accelerating degradation.
-        3. **Usability:** the compressor is at **{metro_analysis["usability"]["composite_pct"]:.0f}%** usability. Below 50% warrants expedited intervention.
-        4. Review the process settings tied to batch **{ev_analysis["focus_batch"]}**, then compare them against the highest-risk supplier genealogy path.
+        2. **Containment:** treat lot **{ev_analysis["containment_summary"]["affected_lot"]}** as the active containment lot. Hold **{ev_analysis["containment_summary"]["dealer_hold_count"]}** unsold vehicles at dealers and issue urgent recall / inspection for **{ev_analysis["containment_summary"]["recall_count"]}** sold vehicles.
+        3. **Demo narrative:** explain the lot tab in three beats only: source lot, impact split, action queue.
+        4. **Customer action:** show how this same pattern extends from predictive maintenance into downstream quality containment and service execution.
+        5. **Enterprise next step:** connect real VIN, dealer inventory, and service campaign data so this workflow moves from demo containment to production execution.
         """
     )
 
