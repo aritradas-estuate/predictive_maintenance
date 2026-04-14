@@ -1,13 +1,17 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
+#     "filterpy==1.4.5",
+#     "hmmlearn==0.3.3",
 #     "lightgbm==4.6.0",
 #     "marimo>=0.22.4",
 #     "networkx==3.6.1",
 #     "numpy==2.4.4",
 #     "pandas==3.0.2",
 #     "plotly==6.6.0",
+#     "pywavelets==1.9.0",
 #     "scikit-learn==1.8.0",
+#     "scipy==1.17.1",
 # ]
 # ///
 
@@ -56,6 +60,7 @@ def _():
         make_subplots,
         mo,
         np,
+        nx,
         pd,
         px,
         roc_auc_score,
@@ -76,6 +81,7 @@ def _(
     go,
     make_subplots,
     np,
+    nx,
     pd,
     px,
     roc_auc_score,
@@ -1168,6 +1174,10 @@ def _(
                 "recommended_action": f"{schedule['recommendation']} within {schedule['maintenance_window']}",
             }
 
+            health_states = _compute_health_states(
+                entity_df, sensor_cols, time_col, comp_col
+            )
+
             return {
                 "entity_df": entity_df,
                 "risk_score": float(latest["risk_score"]),
@@ -1181,6 +1191,7 @@ def _(
                 "precursor_df": precursor_df,
                 "regime_summary": regime_summary,
                 "incident_summary": incident_summary,
+                "health_states": health_states,
                 "context": context,
                 "label": label,
             }
@@ -1374,6 +1385,19 @@ def _(
             ]
         )
 
+        health_states = summary["health_states"]
+        kalman_fig = _build_kalman_fig(asset_df, health_states, time_col)
+        hmm_fig = _build_hmm_fig(asset_df, health_states, time_col)
+
+        weibull_result = _weibull_survival_analysis(
+            asset_df,
+            asset_df["risk_score"],
+            sensor_cols,
+            time_col,
+            comp_col,
+        )
+        weibull_fig = _build_weibull_fig(weibull_result)
+
         deg_fig = _build_degradation_fig(
             asset_df, degradation, sensor_cols, time_col, sensor_labels
         )
@@ -1479,6 +1503,11 @@ def _(
             "economics_table": economics_table,
             "economics_fig": economics_fig,
             "incident_card": incident_card,
+            "health_states": health_states,
+            "kalman_fig": kalman_fig,
+            "hmm_fig": hmm_fig,
+            "weibull": weibull_result,
+            "weibull_fig": weibull_fig,
         }
 
 
@@ -2524,6 +2553,22 @@ def _(
         fingerprint_fig = _build_quality_fingerprint_fig(
             lead_indicator_table.head(6)
         )
+        # SPC analysis
+        _spc_values = batch_summary.sort_values(batch_col)["avg_risk"].values
+        _spc_center = float(np.mean(_spc_values))
+        _spc_sigma = float(np.std(_spc_values))
+        spc_violations = _detect_spc_violations(
+            _spc_values, _spc_center, _spc_sigma
+        )
+
+        spc_control_fig = _build_spc_control_chart(
+            batch_summary, batch_col, focus_batch, spc_violations
+        )
+        # Defect propagation network
+        defect_network = _build_defect_propagation_network(
+            ev_state, modeled_df, focus_batch
+        )
+
         quality_control_fig = _build_quality_control_fig(
             batch_summary, batch_col, focus_batch
         )
@@ -2564,6 +2609,9 @@ def _(
             "process_drift_fig": process_drift_fig,
             "fingerprint_fig": fingerprint_fig,
             "quality_control_fig": quality_control_fig,
+            "spc_control_fig": spc_control_fig,
+            "spc_violations": spc_violations,
+            "defect_network": defect_network,
             "lead_indicator_table": lead_indicator_table,
             "predictive_quality_summary": predictive_quality_summary,
         }
@@ -2571,6 +2619,1066 @@ def _(
 
     metro_state = prepare_metro_dataset()
     ev_state = prepare_ev_dataset()
+
+
+    def _build_defect_propagation_network(ev_state, modeled_df, focus_batch):
+        """Build a networkx-based defect propagation graph.
+
+        Models the genealogy as a directed graph: Supplier -> Line -> Shift -> Batch -> Vehicle -> Dealer.
+        Computes blast radius (downstream impact count) for each defect origin node.
+        Returns the graph, blast radius stats, and a Plotly figure.
+        """
+        supplier_col = ev_state["supplier_col"]
+        line_col = ev_state["line_col"]
+        shift_col = ev_state["shift_col"]
+        batch_col = ev_state["batch_col"]
+        vehicle_col = ev_state["vehicle_col"]
+        dealer_col = ev_state["dealer_col"]
+        grade_col = ev_state["grade_col"]
+
+        focus_rows = modeled_df.loc[
+            modeled_df[batch_col].astype(str) == str(focus_batch)
+        ]
+        if focus_rows.empty:
+            focus_rows = modeled_df.head(100)
+
+        # Build directed graph
+        G = nx.DiGraph()
+
+        # Add nodes by layer with attributes
+        suppliers = focus_rows[supplier_col].astype(str).unique()
+        lines = focus_rows[line_col].astype(str).unique()
+        shifts = focus_rows[shift_col].astype(str).unique()
+        batches = focus_rows[batch_col].astype(str).unique()
+        vehicles = focus_rows[vehicle_col].astype(str).unique()
+        dealers = focus_rows[dealer_col].astype(str).unique()
+
+        for s in suppliers:
+            G.add_node(f"supplier:{s}", layer="Supplier", label=s)
+        for l in lines:
+            G.add_node(f"line:{l}", layer="Line", label=l)
+        for sh in shifts:
+            G.add_node(f"shift:{sh}", layer="Shift", label=sh)
+        for b in batches:
+            G.add_node(f"batch:{b}", layer="Batch", label=b)
+        for v in vehicles:
+            G.add_node(f"vehicle:{v}", layer="Vehicle", label=v[:12])
+        for d in dealers:
+            G.add_node(f"dealer:{d}", layer="Dealer", label=d)
+
+        # Add edges from each row
+        for _, row in focus_rows.iterrows():
+            s = str(row[supplier_col])
+            l = str(row[line_col])
+            sh = str(row[shift_col])
+            b = str(row[batch_col])
+            v = str(row[vehicle_col])
+            d = str(row[dealer_col])
+
+            G.add_edge(f"supplier:{s}", f"line:{l}")
+            G.add_edge(f"line:{l}", f"shift:{sh}")
+            G.add_edge(f"shift:{sh}", f"batch:{b}")
+            G.add_edge(f"batch:{b}", f"vehicle:{v}")
+            G.add_edge(f"vehicle:{v}", f"dealer:{d}")
+
+        # Compute blast radius: for each upstream node, count all downstream reachable nodes
+        blast_radius = {}
+        for node in G.nodes():
+            descendants = nx.descendants(G, node)
+            layer = G.nodes[node].get("layer", "")
+            if layer in ("Supplier", "Line", "Shift"):
+                # Count only vehicle and dealer descendants
+                vehicle_count = sum(
+                    1 for d in descendants if G.nodes[d].get("layer") == "Vehicle"
+                )
+                dealer_count = sum(
+                    1 for d in descendants if G.nodes[d].get("layer") == "Dealer"
+                )
+                blast_radius[node] = {
+                    "label": G.nodes[node]["label"],
+                    "layer": layer,
+                    "vehicles_affected": vehicle_count,
+                    "dealers_affected": dealer_count,
+                    "total_downstream": len(descendants),
+                }
+
+        # Blast radius summary table
+        blast_rows = sorted(
+            blast_radius.values(), key=lambda x: -x["vehicles_affected"]
+        )
+        blast_df = (
+            pd.DataFrame(blast_rows)
+            if blast_rows
+            else pd.DataFrame(
+                columns=[
+                    "label",
+                    "layer",
+                    "vehicles_affected",
+                    "dealers_affected",
+                    "total_downstream",
+                ]
+            )
+        )
+        if not blast_df.empty:
+            blast_df = blast_df.rename(
+                columns={
+                    "label": "Origin",
+                    "layer": "Layer",
+                    "vehicles_affected": "Vehicles affected",
+                    "dealers_affected": "Dealers affected",
+                    "total_downstream": "Total downstream nodes",
+                }
+            )
+
+        # Build a Plotly figure for the network using hierarchical layout
+        layer_order = {
+            "Supplier": 0,
+            "Line": 1,
+            "Shift": 2,
+            "Batch": 3,
+            "Vehicle": 4,
+            "Dealer": 5,
+        }
+        layer_colors = {
+            "Supplier": "#315c72",
+            "Line": "#8aa1af",
+            "Shift": "#cf8f3d",
+            "Batch": "#475569",
+            "Vehicle": "#6b7280",
+            "Dealer": "#b91c1c",
+        }
+
+        # Position nodes by layer
+        pos = {}
+        layer_nodes = {}
+        for node in G.nodes():
+            layer = G.nodes[node].get("layer", "Unknown")
+            if layer not in layer_nodes:
+                layer_nodes[layer] = []
+            layer_nodes[layer].append(node)
+
+        for layer, nodes in layer_nodes.items():
+            x = layer_order.get(layer, 0)
+            for i, node in enumerate(nodes):
+                y = (i - len(nodes) / 2) * 1.0
+                pos[node] = (x, y)
+
+        # Create edge traces
+        edge_x, edge_y = [], []
+        for u, v in G.edges():
+            x0, y0 = pos.get(u, (0, 0))
+            x1, y1 = pos.get(v, (0, 0))
+            edge_x.extend([x0, x1, None])
+            edge_y.extend([y0, y1, None])
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=edge_x,
+                y=edge_y,
+                mode="lines",
+                line={"width": 0.5, "color": "rgba(49, 92, 114, 0.2)"},
+                hoverinfo="none",
+                showlegend=False,
+            )
+        )
+
+        # Node traces by layer
+        for layer, nodes in layer_nodes.items():
+            node_x = [pos[n][0] for n in nodes]
+            node_y = [pos[n][1] for n in nodes]
+            labels = [G.nodes[n].get("label", n) for n in nodes]
+            sizes = []
+            for n in nodes:
+                br = blast_radius.get(n, {})
+                sizes.append(max(8, min(24, 8 + br.get("vehicles_affected", 0))))
+
+            fig.add_trace(
+                go.Scatter(
+                    x=node_x,
+                    y=node_y,
+                    mode="markers+text",
+                    marker={
+                        "size": sizes,
+                        "color": layer_colors.get(layer, "#6b7280"),
+                    },
+                    text=labels if len(nodes) <= 8 else [""] * len(nodes),
+                    textposition="top center",
+                    textfont={"size": 10},
+                    name=layer,
+                    hovertext=[f"{layer}: {l}" for l in labels],
+                )
+            )
+
+        apply_panel_layout(
+            fig,
+            title=f"Defect propagation network (focus: {focus_batch})",
+            height=420,
+            top_margin=72,
+            legend_y=1.03,
+        )
+        fig.update_layout(
+            xaxis={"showgrid": False, "zeroline": False, "showticklabels": False},
+            yaxis={"showgrid": False, "zeroline": False, "showticklabels": False},
+        )
+
+        return {
+            "graph": G,
+            "blast_radius_df": blast_df,
+            "fig": fig,
+            "node_count": G.number_of_nodes(),
+            "edge_count": G.number_of_edges(),
+        }
+
+
+    def _detect_spc_violations(values, center, sigma):
+        """Detect Western Electric SPC rule violations.
+
+        Rules:
+        1. One point beyond 3-sigma (Zone A)
+        2. Two of three consecutive points beyond 2-sigma (same side)
+        3. Four of five consecutive points beyond 1-sigma (same side)
+        4. Seven consecutive points on the same side of center line
+        5. Six consecutive points increasing or decreasing (trend)
+        6. Fifteen consecutive points within 1-sigma (stratification / hugging)
+
+        Returns a list of dicts with violation details.
+        """
+        vals = np.array(values, dtype=float)
+        n = len(vals)
+        violations = []
+
+        sigma_1 = center + sigma
+        sigma_neg1 = center - sigma
+        sigma_2 = center + 2 * sigma
+        sigma_neg2 = center - 2 * sigma
+        sigma_3 = center + 3 * sigma
+        sigma_neg3 = center - 3 * sigma
+
+        # Rule 1: One point beyond 3-sigma
+        for i in range(n):
+            if vals[i] > sigma_3 or vals[i] < sigma_neg3:
+                side = "above" if vals[i] > sigma_3 else "below"
+                violations.append(
+                    {
+                        "rule": "Rule 1: Beyond 3σ",
+                        "index": i,
+                        "description": f"Point {side} 3σ limit",
+                        "severity": "critical",
+                    }
+                )
+
+        # Rule 2: Two of three beyond 2-sigma (same side)
+        for i in range(2, n):
+            window = vals[i - 2 : i + 1]
+            above_2s = np.sum(window > sigma_2)
+            below_2s = np.sum(window < sigma_neg2)
+            if above_2s >= 2:
+                violations.append(
+                    {
+                        "rule": "Rule 2: 2-of-3 beyond 2σ",
+                        "index": i,
+                        "description": "2 of 3 points above 2σ",
+                        "severity": "warning",
+                    }
+                )
+            if below_2s >= 2:
+                violations.append(
+                    {
+                        "rule": "Rule 2: 2-of-3 beyond 2σ",
+                        "index": i,
+                        "description": "2 of 3 points below -2σ",
+                        "severity": "warning",
+                    }
+                )
+
+        # Rule 3: Four of five beyond 1-sigma (same side)
+        for i in range(4, n):
+            window = vals[i - 4 : i + 1]
+            above_1s = np.sum(window > sigma_1)
+            below_1s = np.sum(window < sigma_neg1)
+            if above_1s >= 4:
+                violations.append(
+                    {
+                        "rule": "Rule 3: 4-of-5 beyond 1σ",
+                        "index": i,
+                        "description": "4 of 5 points above 1σ",
+                        "severity": "warning",
+                    }
+                )
+            if below_1s >= 4:
+                violations.append(
+                    {
+                        "rule": "Rule 3: 4-of-5 beyond 1σ",
+                        "index": i,
+                        "description": "4 of 5 points below -1σ",
+                        "severity": "warning",
+                    }
+                )
+
+        # Rule 4: Seven consecutive on same side
+        for i in range(6, n):
+            window = vals[i - 6 : i + 1]
+            if np.all(window > center):
+                violations.append(
+                    {
+                        "rule": "Rule 4: 7 consecutive same side",
+                        "index": i,
+                        "description": "7 consecutive above center",
+                        "severity": "warning",
+                    }
+                )
+            elif np.all(window < center):
+                violations.append(
+                    {
+                        "rule": "Rule 4: 7 consecutive same side",
+                        "index": i,
+                        "description": "7 consecutive below center",
+                        "severity": "warning",
+                    }
+                )
+
+        # Rule 5: Six consecutive increasing or decreasing
+        for i in range(5, n):
+            window = vals[i - 5 : i + 1]
+            diffs = np.diff(window)
+            if np.all(diffs > 0):
+                violations.append(
+                    {
+                        "rule": "Rule 5: 6 consecutive trend",
+                        "index": i,
+                        "description": "6 consecutive increasing",
+                        "severity": "warning",
+                    }
+                )
+            elif np.all(diffs < 0):
+                violations.append(
+                    {
+                        "rule": "Rule 5: 6 consecutive trend",
+                        "index": i,
+                        "description": "6 consecutive decreasing",
+                        "severity": "warning",
+                    }
+                )
+
+        # Deduplicate by (rule, index)
+        seen = set()
+        unique_violations = []
+        for v in violations:
+            key = (v["rule"], v["index"])
+            if key not in seen:
+                seen.add(key)
+                unique_violations.append(v)
+
+        return unique_violations
+
+
+    def _build_spc_control_chart(
+        batch_summary, batch_col, focus_batch, spc_violations
+    ):
+        """Enhanced batch quality control chart with SPC zone bands and violation markers."""
+        chart_df = batch_summary.sort_values(batch_col).copy()
+        values = chart_df["avg_risk"].values
+        center = float(np.mean(values))
+        sigma = float(np.std(values))
+
+        fig = go.Figure()
+
+        # Zone bands (3-sigma, 2-sigma, 1-sigma)
+        fig.add_hrect(
+            y0=center + 2 * sigma,
+            y1=center + 3 * sigma,
+            fillcolor="rgba(185, 28, 28, 0.06)",
+            line_width=0,
+            annotation_text="Zone A",
+            annotation_position="top right",
+        )
+        fig.add_hrect(
+            y0=center + sigma,
+            y1=center + 2 * sigma,
+            fillcolor="rgba(207, 143, 61, 0.06)",
+            line_width=0,
+        )
+        fig.add_hrect(
+            y0=center - sigma,
+            y1=center + sigma,
+            fillcolor="rgba(49, 92, 114, 0.04)",
+            line_width=0,
+        )
+        fig.add_hrect(
+            y0=center - 2 * sigma,
+            y1=center - sigma,
+            fillcolor="rgba(207, 143, 61, 0.06)",
+            line_width=0,
+        )
+        fig.add_hrect(
+            y0=center - 3 * sigma,
+            y1=center - 2 * sigma,
+            fillcolor="rgba(185, 28, 28, 0.06)",
+            line_width=0,
+        )
+
+        # Main data line
+        fig.add_trace(
+            go.Scatter(
+                x=chart_df[batch_col],
+                y=chart_df["avg_risk"],
+                mode="lines+markers",
+                name="Avg batch risk",
+                line={"width": 2, "color": "#315c72"},
+                marker={"size": 6},
+            )
+        )
+
+        # Focus batch highlight
+        focus_row = chart_df.loc[
+            chart_df[batch_col].astype(str) == str(focus_batch)
+        ]
+        if not focus_row.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=focus_row[batch_col],
+                    y=focus_row["avg_risk"],
+                    mode="markers",
+                    name="Focus lot",
+                    marker={
+                        "size": 14,
+                        "color": "#b91c1c",
+                        "line": {"color": "#ffffff", "width": 1.5},
+                    },
+                )
+            )
+
+        # SPC violation markers
+        violation_indices = set()
+        for v in spc_violations:
+            idx = v["index"]
+            if 0 <= idx < len(chart_df):
+                violation_indices.add(idx)
+
+        if violation_indices:
+            v_indices = sorted(violation_indices)
+            v_x = chart_df[batch_col].iloc[v_indices]
+            v_y = chart_df["avg_risk"].iloc[v_indices]
+            fig.add_trace(
+                go.Scatter(
+                    x=v_x,
+                    y=v_y,
+                    mode="markers",
+                    name="SPC violation",
+                    marker={
+                        "size": 12,
+                        "color": "rgba(185, 28, 28, 0.0)",
+                        "line": {"color": "#b91c1c", "width": 2.5},
+                        "symbol": "diamond-open",
+                    },
+                )
+            )
+
+        # Control lines
+        fig.add_hline(
+            y=center, line_dash="dash", line_color="#6b7280", annotation_text="CL"
+        )
+        fig.add_hline(
+            y=center + 2 * sigma,
+            line_dash="dot",
+            line_color="#cf8f3d",
+            annotation_text="+2σ",
+        )
+        fig.add_hline(
+            y=center - 2 * sigma,
+            line_dash="dot",
+            line_color="#cf8f3d",
+            annotation_text="-2σ",
+        )
+        fig.add_hline(
+            y=center + 3 * sigma,
+            line_dash="dash",
+            line_color="#b91c1c",
+            annotation_text="UCL (+3σ)",
+        )
+        fig.add_hline(
+            y=center - 3 * sigma,
+            line_dash="dash",
+            line_color="#b91c1c",
+            annotation_text="LCL (-3σ)",
+        )
+
+        n_violations = len(spc_violations)
+        unique_rules = len(set(v["rule"] for v in spc_violations))
+        title_suffix = (
+            f" — {n_violations} SPC violation{'s' if n_violations != 1 else ''} ({unique_rules} rule{'s' if unique_rules != 1 else ''})"
+            if n_violations > 0
+            else " — In control"
+        )
+
+        apply_panel_layout(
+            fig,
+            title="SPC control chart" + title_suffix,
+            height=400,
+            top_margin=78,
+            legend_y=1.03,
+        )
+        fig.update_layout(xaxis_title="Batch", yaxis_title="Avg predicted risk")
+        return fig
+
+
+    def _weibull_survival_analysis(
+        asset_df, risk_series, sensor_cols, time_col, comp_col=None
+    ):
+        """Weibull-based survival analysis for failure time modeling.
+
+        Fits a Weibull distribution to the risk trajectory to produce:
+        - Proper probabilistic failure time distribution
+        - Survival function with confidence bounds
+        - Hazard rate (instantaneous failure probability)
+        - Mean time to failure (MTTF) estimate
+        """
+        import math
+        from scipy.stats import weibull_min
+        from scipy.optimize import minimize_scalar
+
+        n = len(asset_df)
+        risk = risk_series.values
+
+        # Estimate hours per step
+        if time_col in asset_df.columns and n >= 2:
+            ts = pd.to_datetime(asset_df[time_col])
+            total_hours = (ts.iloc[-1] - ts.iloc[0]).total_seconds() / 3600
+            hours_per_step = max(0.01, total_hours / max(1, n - 1))
+        else:
+            hours_per_step = 1.0
+
+        # Build pseudo time-to-event data from risk exceedances
+        # Treat risk crossing various thresholds as "events"
+        risk_threshold = max(70.0, float(np.quantile(risk, 0.90)))
+        current_risk = float(risk[-1])
+
+        # Compute rolling max risk to capture escalation pattern
+        window = max(12, n // 20)
+        rolling_max = (
+            pd.Series(risk).rolling(window, min_periods=4).max().bfill().values
+        )
+
+        # Generate synthetic time-to-threshold data from independent windows
+        event_times = []
+        window_size = max(48, n // 10)
+        stride = window_size // 2
+        for start in range(0, n - window_size, stride):
+            chunk = risk[start : start + window_size]
+            exceeds = np.where(chunk >= risk_threshold * 0.7)[0]
+            if len(exceeds) > 0:
+                event_times.append(exceeds[0] * hours_per_step)
+            else:
+                # Right-censored: didn't reach threshold in this window
+                event_times.append(window_size * hours_per_step)
+
+        if len(event_times) < 3:
+            # Not enough data; fall back to simple estimate
+            event_times = [
+                max(12, n * hours_per_step * 0.3),
+                max(24, n * hours_per_step * 0.6),
+                max(48, n * hours_per_step * 0.9),
+            ]
+
+        event_arr = np.array(event_times, dtype=float)
+        event_arr = event_arr[event_arr > 0]
+        if len(event_arr) < 2:
+            event_arr = np.array([24.0, 48.0, 96.0])
+
+        # Fit Weibull parameters using MLE
+        try:
+            shape, loc, scale = weibull_min.fit(event_arr, floc=0)
+            shape = max(0.5, min(10.0, shape))
+            scale = max(1.0, scale)
+        except Exception:
+            shape, loc, scale = 2.0, 0.0, float(np.median(event_arr))
+
+        # Generate survival and hazard curves
+        t_max = max(scale * 3, 200)
+        t_grid = np.linspace(0.1, t_max, 200)
+
+        survival = weibull_min.sf(t_grid, shape, loc=0, scale=scale)
+        hazard = (shape / scale) * (t_grid / scale) ** (shape - 1)
+        pdf = weibull_min.pdf(t_grid, shape, loc=0, scale=scale)
+
+        # Key statistics
+        mttf = scale * np.exp(math.lgamma(1 + 1 / shape))  # Mean time to failure
+        median_ttf = scale * (np.log(2)) ** (1 / shape)  # Median time to failure
+
+        # Confidence bounds via bootstrap
+        rng = np.random.default_rng(42)
+        boot_shapes, boot_scales = [], []
+        for _ in range(200):
+            boot_sample = rng.choice(event_arr, size=len(event_arr), replace=True)
+            try:
+                bs, _, bsc = weibull_min.fit(boot_sample, floc=0)
+                boot_shapes.append(max(0.5, min(10.0, bs)))
+                boot_scales.append(max(1.0, bsc))
+            except Exception:
+                pass
+
+        if len(boot_shapes) >= 10:
+            surv_lower = np.percentile(
+                [
+                    weibull_min.sf(t_grid, s, loc=0, scale=sc)
+                    for s, sc in zip(boot_shapes, boot_scales)
+                ],
+                5,
+                axis=0,
+            )
+            surv_upper = np.percentile(
+                [
+                    weibull_min.sf(t_grid, s, loc=0, scale=sc)
+                    for s, sc in zip(boot_shapes, boot_scales)
+                ],
+                95,
+                axis=0,
+            )
+            mttf_ci = (
+                float(
+                    np.percentile(
+                        [
+                            sc * np.exp(math.lgamma(1 + 1 / s))
+                            for s, sc in zip(boot_shapes, boot_scales)
+                        ],
+                        5,
+                    )
+                ),
+                float(
+                    np.percentile(
+                        [
+                            sc * np.exp(math.lgamma(1 + 1 / s))
+                            for s, sc in zip(boot_shapes, boot_scales)
+                        ],
+                        95,
+                    )
+                ),
+            )
+        else:
+            surv_lower = survival * 0.8
+            surv_upper = np.minimum(survival * 1.2, 1.0)
+            mttf_ci = (mttf * 0.7, mttf * 1.3)
+
+        # Probability of failure at specific horizons
+        prob_24h = float(1 - weibull_min.sf(24, shape, loc=0, scale=scale))
+        prob_48h = float(1 - weibull_min.sf(48, shape, loc=0, scale=scale))
+        prob_72h = float(1 - weibull_min.sf(72, shape, loc=0, scale=scale))
+
+        return {
+            "shape": float(shape),
+            "scale": float(scale),
+            "mttf": float(mttf),
+            "median_ttf": float(median_ttf),
+            "mttf_ci": mttf_ci,
+            "t_grid": t_grid,
+            "survival": survival,
+            "surv_lower": surv_lower,
+            "surv_upper": surv_upper,
+            "hazard": hazard,
+            "pdf": pdf,
+            "prob_24h": prob_24h,
+            "prob_48h": prob_48h,
+            "prob_72h": prob_72h,
+            "hours_per_step": hours_per_step,
+        }
+
+
+    def _build_weibull_fig(weibull_result):
+        """Build Weibull survival analysis figure with survival curve, hazard, and PDF."""
+        t = weibull_result["t_grid"]
+        surv = weibull_result["survival"]
+        surv_lo = weibull_result["surv_lower"]
+        surv_hi = weibull_result["surv_upper"]
+        hazard = weibull_result["hazard"]
+        pdf = weibull_result["pdf"]
+
+        fig = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.12,
+            row_heights=[0.6, 0.4],
+            subplot_titles=[
+                f"Survival function (Weibull: shape={weibull_result['shape']:.2f}, scale={weibull_result['scale']:.0f}h)",
+                "Hazard rate (instantaneous failure intensity)",
+            ],
+        )
+
+        # Confidence band
+        fig.add_trace(
+            go.Scatter(
+                x=list(t) + list(t)[::-1],
+                y=list(surv_hi * 100) + list(surv_lo * 100)[::-1],
+                fill="toself",
+                fillcolor="rgba(49, 92, 114, 0.10)",
+                line={"width": 0},
+                name="90% CI",
+                hoverinfo="skip",
+            ),
+            row=1,
+            col=1,
+        )
+        # Survival curve
+        fig.add_trace(
+            go.Scatter(
+                x=t,
+                y=surv * 100,
+                name="Survival probability",
+                line={"width": 2.5, "color": "#315c72"},
+            ),
+            row=1,
+            col=1,
+        )
+        # 50% survival line
+        fig.add_hline(
+            y=50,
+            line_dash="dash",
+            line_color="#6b7280",
+            opacity=0.5,
+            annotation_text=f"Median TTF: {weibull_result['median_ttf']:.0f}h",
+            annotation_position="top right",
+            row=1,
+            col=1,
+        )
+
+        # Hazard rate
+        fig.add_trace(
+            go.Scatter(
+                x=t,
+                y=hazard,
+                name="Hazard rate",
+                line={"width": 2, "color": "#b91c1c"},
+                fill="tozeroy",
+                fillcolor="rgba(185, 28, 28, 0.08)",
+            ),
+            row=2,
+            col=1,
+        )
+
+        apply_panel_layout(
+            fig,
+            title="Weibull survival analysis",
+            height=480,
+            top_margin=72,
+            legend_y=1.03,
+        )
+        fig.update_yaxes(title_text="Survival (%)", range=[0, 105], row=1, col=1)
+        fig.update_yaxes(title_text="Hazard rate", row=2, col=1)
+        fig.update_xaxes(title_text="Hours from now", row=2, col=1)
+        return fig
+
+
+    def _compute_health_states(asset_df, sensor_cols, time_col, comp_col=None):
+        """Kalman filter + HMM health state estimation.
+
+        Ported from signal_analysis.py for integration in the main dashboard.
+        Returns health_level, health_trend, uncertainty, HMM state labels,
+        transition matrix, and state percentages.
+        """
+        from filterpy.kalman import KalmanFilter
+        from hmmlearn.hmm import GaussianHMM
+        from scipy.stats import kurtosis as scipy_kurtosis
+
+        n = len(asset_df)
+        if n < 48:
+            return {
+                "health_level": np.zeros(n),
+                "health_trend": np.zeros(n),
+                "uncertainty": np.ones(n) * 0.5,
+                "hmm_states": pd.Series(["Healthy"] * n, index=asset_df.index),
+                "transition_matrix": pd.DataFrame(),
+                "state_pct": {"Healthy": 100.0, "Degrading": 0.0, "Critical": 0.0},
+                "current_state": "Healthy",
+            }
+
+        is_running = (
+            asset_df[comp_col].astype(float) >= 0.5
+            if comp_col and comp_col in asset_df.columns
+            else pd.Series(True, index=asset_df.index)
+        )
+        window = max(12, min(72, n // 12 or 12))
+
+        # Build normalized feature matrix from time-domain features
+        health_signals = pd.DataFrame(index=asset_df.index)
+        for col in sensor_cols:
+            series = (
+                asset_df[col].astype(float).interpolate(limit_direction="both")
+            )
+            # RMS
+            rms = (
+                series.rolling(window, min_periods=4)
+                .apply(lambda x: np.sqrt(np.mean(x**2)), raw=True)
+                .bfill()
+                .ffill()
+            )
+            # Crest factor
+            crest = (
+                series.rolling(window, min_periods=4)
+                .apply(
+                    lambda x: np.max(np.abs(x)) / (np.sqrt(np.mean(x**2)) + 1e-12),
+                    raw=True,
+                )
+                .bfill()
+                .ffill()
+            )
+            # Kurtosis
+            kurt = (
+                series.rolling(window, min_periods=4)
+                .apply(
+                    lambda x: (
+                        scipy_kurtosis(x, fisher=False) if len(x) >= 4 else 3.0
+                    ),
+                    raw=True,
+                )
+                .bfill()
+                .ffill()
+            )
+
+            for feat_name, feat_vals in [
+                ("rms", rms),
+                ("crest", crest),
+                ("kurt", kurt),
+            ]:
+                _min, _max = feat_vals.min(), feat_vals.max()
+                if _max - _min > 1e-8:
+                    health_signals[f"{col}_{feat_name}"] = (feat_vals - _min) / (
+                        _max - _min
+                    )
+                else:
+                    health_signals[f"{col}_{feat_name}"] = 0.0
+
+        observation = health_signals.mean(axis=1).values
+
+        # --- Kalman Filter: state = [health_level, health_trend] ---
+        kf = KalmanFilter(dim_x=2, dim_z=1)
+        kf.x = np.array([[observation[0]], [0.0]])
+        kf.F = np.array([[1, 1], [0, 1]])
+        kf.H = np.array([[1, 0]])
+        kf.P *= 10
+        kf.R = np.array([[0.1]])
+        kf.Q = np.array([[0.001, 0], [0, 0.0001]])
+
+        kalman_states = np.zeros((n, 2))
+        kalman_covs = np.zeros(n)
+        for i in range(n):
+            kf.predict()
+            kf.update(np.array([[observation[i]]]))
+            kalman_states[i] = kf.x.flatten()
+            kalman_covs[i] = kf.P[0, 0]
+
+        health_level = kalman_states[:, 0]
+        health_trend = kalman_states[:, 1]
+        uncertainty = 2 * np.sqrt(kalman_covs)
+
+        # --- HMM: 3-state health classification ---
+        feature_matrix = health_signals.dropna().values
+        if len(feature_matrix) < 48:
+            hmm_labels = pd.Series(["Healthy"] * n, index=asset_df.index)
+            trans_df = pd.DataFrame()
+            state_pct = {"Healthy": 100.0, "Degrading": 0.0, "Critical": 0.0}
+        else:
+            hmm = GaussianHMM(
+                n_components=3,
+                covariance_type="full",
+                n_iter=100,
+                random_state=42,
+                tol=0.01,
+            )
+            hmm.fit(feature_matrix)
+            hidden = hmm.predict(feature_matrix)
+
+            state_means = [feature_matrix[hidden == s].mean() for s in range(3)]
+            state_order = np.argsort(state_means)
+            state_map = {
+                state_order[0]: "Healthy",
+                state_order[1]: "Degrading",
+                state_order[2]: "Critical",
+            }
+
+            labeled = pd.Series(
+                [state_map[s] for s in hidden],
+                index=health_signals.dropna().index,
+                name="health_state",
+            )
+            hmm_labels = labeled.reindex(asset_df.index, fill_value="Healthy")
+
+            trans_df = pd.DataFrame(
+                hmm.transmat_,
+                index=[state_map[state_order[i]] for i in range(3)],
+                columns=[state_map[state_order[i]] for i in range(3)],
+            ).round(3)
+
+            counts = labeled.value_counts()
+            total = max(1, len(labeled))
+            state_pct = {
+                "Healthy": round(float(counts.get("Healthy", 0)) / total * 100, 1),
+                "Degrading": round(
+                    float(counts.get("Degrading", 0)) / total * 100, 1
+                ),
+                "Critical": round(
+                    float(counts.get("Critical", 0)) / total * 100, 1
+                ),
+            }
+
+        current_state = (
+            str(hmm_labels.iloc[-1]) if len(hmm_labels) > 0 else "Healthy"
+        )
+
+        return {
+            "health_level": health_level,
+            "health_trend": health_trend,
+            "uncertainty": uncertainty,
+            "hmm_states": hmm_labels,
+            "transition_matrix": trans_df,
+            "state_pct": state_pct,
+            "current_state": current_state,
+        }
+
+
+    def _build_kalman_fig(asset_df, health_states, time_col):
+        """Build Kalman filter health state figure."""
+        t_vals = (
+            asset_df[time_col]
+            if time_col in asset_df.columns
+            else list(range(len(asset_df)))
+        )
+        n = len(asset_df)
+        step = max(1, n // 1500)
+        idx = np.arange(0, n, step)
+
+        health_level = health_states["health_level"]
+        health_trend = health_states["health_trend"]
+        uncertainty = health_states["uncertainty"]
+
+        fig = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.10,
+            row_heights=[0.65, 0.35],
+            subplot_titles=[
+                "Health level (Kalman filtered)",
+                "Health trend (rate of change)",
+            ],
+        )
+
+        # Uncertainty band
+        t_ds = (
+            t_vals.iloc[idx]
+            if hasattr(t_vals, "iloc")
+            else [t_vals[i] for i in idx]
+        )
+        upper = (health_level + uncertainty)[idx]
+        lower = (health_level - uncertainty)[idx]
+        fig.add_trace(
+            go.Scatter(
+                x=list(t_ds) + list(t_ds)[::-1],
+                y=list(upper) + list(lower)[::-1],
+                fill="toself",
+                fillcolor="rgba(49, 92, 114, 0.12)",
+                line={"width": 0},
+                showlegend=True,
+                name="95% confidence",
+                hoverinfo="skip",
+            ),
+            row=1,
+            col=1,
+        )
+        # Health level line
+        fig.add_trace(
+            go.Scatter(
+                x=t_ds,
+                y=health_level[idx],
+                name="Health level",
+                line={"width": 2.5, "color": "#315c72"},
+            ),
+            row=1,
+            col=1,
+        )
+        # Health trend
+        fig.add_trace(
+            go.Scatter(
+                x=t_ds,
+                y=health_trend[idx],
+                name="Trend",
+                line={"width": 2, "color": "#cf8f3d"},
+            ),
+            row=2,
+            col=1,
+        )
+        fig.add_hline(
+            y=0, line_dash="dash", line_color="#6b7280", opacity=0.5, row=2, col=1
+        )
+
+        apply_panel_layout(
+            fig,
+            title="Kalman filter: hidden health state",
+            height=440,
+            top_margin=72,
+            legend_y=1.03,
+        )
+        fig.update_yaxes(title_text="Health index", row=1, col=1)
+        fig.update_yaxes(title_text="Rate of change", row=2, col=1)
+        return fig
+
+
+    def _build_hmm_fig(asset_df, health_states, time_col):
+        """Build HMM state classification timeline figure."""
+        t_vals = (
+            asset_df[time_col]
+            if time_col in asset_df.columns
+            else list(range(len(asset_df)))
+        )
+        n = len(asset_df)
+        step = max(1, n // 2000)
+        idx = np.arange(0, n, step)
+
+        hmm_states = health_states["hmm_states"]
+        state_pct = health_states["state_pct"]
+
+        state_config = {
+            "Healthy": {"color": "#315c72", "y": 1},
+            "Degrading": {"color": "#cf8f3d", "y": 2},
+            "Critical": {"color": "#b91c1c", "y": 3},
+        }
+
+        fig = go.Figure()
+        for state_name, cfg in state_config.items():
+            mask = hmm_states.iloc[idx] == state_name
+            if mask.any():
+                sub_idx = idx[mask.values]
+                t_sub = (
+                    t_vals.iloc[sub_idx]
+                    if hasattr(t_vals, "iloc")
+                    else [t_vals[i] for i in sub_idx]
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=t_sub,
+                        y=[cfg["y"]] * len(sub_idx),
+                        mode="markers",
+                        marker={"color": cfg["color"], "size": 4},
+                        name=f"{state_name} ({state_pct.get(state_name, 0):.0f}%)",
+                    )
+                )
+
+        apply_panel_layout(
+            fig,
+            title="HMM health state classification",
+            height=260,
+            top_margin=72,
+            legend_y=1.03,
+        )
+        fig.update_layout(
+            yaxis={
+                "tickvals": [1, 2, 3],
+                "ticktext": ["Healthy", "Degrading", "Critical"],
+                "range": [0.5, 3.5],
+            },
+        )
+        return fig
+
     return analyze_ev, analyze_metro, ev_state, metro_state
 
 
@@ -2795,6 +3903,12 @@ def _(ev_analysis, metro_analysis, mo):
                 bordered=True,
             ),
             mo.stat(
+                value=metro_analysis["health_states"]["current_state"],
+                label="HMM health state",
+                caption=f"{metro_analysis['health_states']['state_pct']['Degrading']:.0f}% degrading, {metro_analysis['health_states']['state_pct']['Critical']:.0f}% critical",
+                bordered=True,
+            ),
+            mo.stat(
                 value=f"{metro_analysis['rul_info']['composite_rul_hours']}h",
                 label="remaining useful life",
                 caption=f"optimal maint. at {metro_analysis['schedule']['optimal_hour']}h",
@@ -2839,7 +3953,7 @@ def _(ROOT, mo):
 
 
 @app.cell(hide_code=True)
-def _(ev_analysis, metro_analysis, mo):
+def _(ev_analysis, metro_analysis, mo, pd):
     maintenance_summary = mo.Html(
         f"""
         <style>
@@ -3052,6 +4166,7 @@ def _(ev_analysis, metro_analysis, mo):
                 ### Executive overview
 
                 - **Predictive maintenance posture:** {metro_analysis["recommendation"]} for the selected asset, with an action window of **{metro_analysis["maintenance_window"]}**.
+                - **Health state estimation:** Kalman-filtered health index with HMM classification puts the asset in a **{metro_analysis["health_states"]["current_state"]}** state ({metro_analysis["health_states"]["state_pct"]["Critical"]:.0f}% of history in Critical).
                 - **Early warning:** the system is surfacing a **{metro_analysis["warning_profile"]["state"]}** signal with **{metro_analysis["warning_profile"]["warning_horizon_hours"]}h** of warning lead time.
                 - **Failure progression:** the current issue is being driven first by **{metro_analysis["incident_card"]["title"]}**, then by the next-ranked precursor signals in the failure ladder.
                 - **Portfolio view:** the notebook now prioritizes a maintenance backlog, not just one machine. Immediate-action items: **{metro_analysis["high_priority_count"]}**.
@@ -3166,7 +4281,7 @@ def _(ev_analysis, metro_analysis, mo):
                 f"""
                 ### Lot genealogy and containment
 
-                Lot genealogy remains the enterprise proof point: the same platform that detects degrading equipment health can also trace process issues into concrete field actions.
+                Lot genealogy remains the enterprise proof point: the same platform that detects degrading equipment health can also trace process issues into concrete field actions. The **defect propagation network** quantifies the blast radius of each upstream origin.
                 """
             ),
             lot_summary,
@@ -3176,6 +4291,17 @@ def _(ev_analysis, metro_analysis, mo):
                 gap=1.0,
                 wrap=True,
                 align="stretch",
+            ),
+            ev_analysis["defect_network"]["fig"],
+            panel(
+                "Defect blast radius (upstream origin → downstream impact)",
+                mo.ui.table(
+                    ev_analysis["defect_network"]["blast_radius_df"],
+                    selection=None,
+                    page_size=8,
+                )
+                if not ev_analysis["defect_network"]["blast_radius_df"].empty
+                else mo.md("_No blast radius data._"),
             ),
             panel(
                 "Operational action queue",
@@ -3205,13 +4331,13 @@ def _(ev_analysis, metro_analysis, mo):
                 f"""
                 ### Predictive quality
 
-                This is the sister capability to predictive maintenance. Instead of waiting for bad lots to surface at the end of inspection, the notebook shows which process signatures are drifting away from healthy operating conditions.
+                This is the sister capability to predictive maintenance. Instead of waiting for bad lots to surface at the end of inspection, the notebook shows which process signatures are drifting away from healthy operating conditions. The **SPC control chart** now applies Western Electric rules to automatically flag suspicious batch patterns.
                 """
             ),
             mo.hstack(
                 [
                     ev_analysis["process_drift_fig"],
-                    ev_analysis["quality_control_fig"],
+                    ev_analysis["spc_control_fig"],
                 ],
                 widths="equal",
                 gap=1.0,
@@ -3234,6 +4360,35 @@ def _(ev_analysis, metro_analysis, mo):
                 ),
             ),
             panel(
+                f"SPC rule violations ({len(ev_analysis['spc_violations'])} detected)",
+                mo.ui.table(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Rule": r,
+                                "Count": len(
+                                    [
+                                        v
+                                        for v in ev_analysis["spc_violations"]
+                                        if v["rule"] == r
+                                    ]
+                                ),
+                            }
+                            for r in sorted(
+                                set(
+                                    v["rule"]
+                                    for v in ev_analysis["spc_violations"]
+                                )
+                            )
+                        ]
+                    )
+                    if ev_analysis["spc_violations"]
+                    else pd.DataFrame([{"Status": "All batches in control"}]),
+                    selection=None,
+                    page_size=6,
+                ),
+            ),
+            panel(
                 "Predictive quality summary",
                 mo.ui.table(
                     ev_analysis["predictive_quality_summary"],
@@ -3250,11 +4405,73 @@ def _(ev_analysis, metro_analysis, mo):
         ### Operational recommendations
 
         1. **Maintenance timing:** schedule maintenance at **{metro_analysis["schedule"]["optimal_hour"]}h** (window: {metro_analysis["maintenance_window"]}). Current urgency is **{metro_analysis["risk_score"]:.0f}/100**.
-        2. **Early warning:** communicate that the system surfaces a **{metro_analysis["warning_profile"]["state"]}** signal with **{metro_analysis["warning_profile"]["warning_horizon_hours"]}h** of advance warning before the machine enters the intervention boundary.
-        3. **Portfolio triage:** prioritize **{metro_analysis["high_priority_count"]}** immediate maintenance items first, then **{metro_analysis["next_shift_count"]}** plan-next-shift items from the backlog board.
-        4. **Failure explanation:** explain the maintenance issue through the top precursor chain, starting with **{metro_analysis["incident_card"]["title"]}** and the driver ladder in the failure-progression tab.
-        5. **Enterprise extension:** use the lot genealogy and predictive-quality tabs to show that the same stack can move from machine health to process health to downstream containment actions.
+        2. **Health state estimation:** the Kalman filter + HMM pipeline classifies the asset as **{metro_analysis["health_states"]["current_state"]}** ({metro_analysis["health_states"]["state_pct"]["Critical"]:.0f}% of history in Critical). Use this alongside the risk score for richer maintenance decisions.
+        3. **Early warning:** communicate that the system surfaces a **{metro_analysis["warning_profile"]["state"]}** signal with **{metro_analysis["warning_profile"]["warning_horizon_hours"]}h** of advance warning before the machine enters the intervention boundary.
+        4. **Portfolio triage:** prioritize **{metro_analysis["high_priority_count"]}** immediate maintenance items first, then **{metro_analysis["next_shift_count"]}** plan-next-shift items from the backlog board.
+        5. **Failure explanation:** explain the maintenance issue through the top precursor chain, starting with **{metro_analysis["incident_card"]["title"]}** and the driver ladder in the failure-progression tab.
+        6. **Enterprise extension:** use the lot genealogy and predictive-quality tabs to show that the same stack can move from machine health to process health to downstream containment actions.
         """
+    )
+
+    health_state_view = mo.vstack(
+        [
+            mo.md(
+                f"""
+                ### Health state estimation
+
+                This view combines **Kalman filtering**, **Hidden Markov Model** classification, and **Weibull survival analysis** for a comprehensive health assessment.
+                The Kalman filter tracks a latent health index and its rate of change with uncertainty bounds.
+                The HMM classifies each time step into discrete health states learned from the data itself (not thresholds).
+
+                **Current HMM state:** {metro_analysis["health_states"]["current_state"]}
+                &nbsp;&bull;&nbsp; Healthy: {metro_analysis["health_states"]["state_pct"]["Healthy"]:.0f}%
+                &nbsp;&bull;&nbsp; Degrading: {metro_analysis["health_states"]["state_pct"]["Degrading"]:.0f}%
+                &nbsp;&bull;&nbsp; Critical: {metro_analysis["health_states"]["state_pct"]["Critical"]:.0f}%
+                """
+            ),
+            mo.hstack(
+                [metro_analysis["kalman_fig"], metro_analysis["hmm_fig"]],
+                widths=[1.6, 1],
+                gap=1.0,
+                wrap=True,
+                align="stretch",
+            ),
+            metro_analysis["weibull_fig"],
+            panel(
+                "Weibull failure time statistics",
+                mo.ui.table(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Shape": f"{metro_analysis['weibull']['shape']:.2f}",
+                                "Scale": f"{metro_analysis['weibull']['scale']:.0f}h",
+                                "MTTF": f"{metro_analysis['weibull']['mttf']:.0f}h",
+                                "MTTF 90% CI": f"{metro_analysis['weibull']['mttf_ci'][0]:.0f}\u2013{metro_analysis['weibull']['mttf_ci'][1]:.0f}h",
+                                "Median TTF": f"{metro_analysis['weibull']['median_ttf']:.0f}h",
+                                "P(fail 24h)": f"{metro_analysis['weibull']['prob_24h']:.0%}",
+                                "P(fail 48h)": f"{metro_analysis['weibull']['prob_48h']:.0%}",
+                                "P(fail 72h)": f"{metro_analysis['weibull']['prob_72h']:.0%}",
+                            }
+                        ]
+                    ),
+                    selection=None,
+                    page_size=2,
+                ),
+            ),
+            panel(
+                "HMM state transition probabilities",
+                mo.ui.table(
+                    metro_analysis["health_states"]["transition_matrix"]
+                    .reset_index()
+                    .rename(columns={"index": "From \\\\ To"}),
+                    selection=None,
+                    page_size=4,
+                )
+                if not metro_analysis["health_states"]["transition_matrix"].empty
+                else mo.md("_Insufficient data for transition matrix._"),
+            ),
+        ],
+        gap=1.0,
     )
 
     app_tabs = mo.ui.tabs(
@@ -3262,6 +4479,7 @@ def _(ev_analysis, metro_analysis, mo):
             "Executive overview": executive_view,
             "Fleet maintenance": fleet_view,
             "Failure progression": failure_view,
+            "Health state estimation": health_state_view,
             "Maintenance economics": maintenance_econ_view,
             "Lot genealogy": genealogy_view,
             "Predictive quality": predictive_quality_view,
