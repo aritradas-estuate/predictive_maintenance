@@ -1,0 +1,111 @@
+- generic [ref=e2]:
+  - generic [ref=e6]:
+    - img [ref=e25]
+    - generic [ref=e10]:
+      - generic [ref=e30]:
+        - generic [ref=e34]:
+          - generic [ref=e35]: Estuate Prismatic Predictive Analytics
+          - heading "Industrial command center for predictive maintenance and lot genealogy" [level=1] [ref=e36]
+          - paragraph [ref=e37]: Detect equipment risk, optimize maintenance timing, trace affected lots and parts, and convert analytical signals into containment, recall, warranty, and service actions. Refreshed on April 6, 2026.
+        - generic [ref=e41]:
+          - heading "Decision controls" [level=3] [ref=e43]
+          - generic [ref=e44]:
+            - generic [ref=e48]:
+              - generic [ref=e52]: selected_asset
+              - combobox "selected_asset" [ref=e53] [cursor=pointer]:
+                - option "Compressor-A" [selected]
+                - option "Compressor-B"
+                - option "Compressor-C"
+            - generic [ref=e57]:
+              - generic [ref=e61]: maintenance_horizon_hours
+              - generic [ref=e62]:
+                - slider [ref=e67]
+                - generic [ref=e68]: "48"
+            - generic [ref=e72]:
+              - generic [ref=e76]: selected_supplier
+              - combobox "selected_supplier" [ref=e77] [cursor=pointer]:
+                - option "All" [selected]
+                - option "Supplier-A"
+                - option "Supplier-B"
+                - option "Supplier-C"
+            - generic [ref=e81]:
+              - generic [ref=e85]: selected_line
+              - combobox "selected_line" [ref=e86] [cursor=pointer]:
+                - option "All" [selected]
+                - option "Line-1"
+                - option "Line-2"
+                - option "Line-3"
+        - generic [ref=e90]:
+          - heading "Containment focus" [level=3] [ref=e93]
+          - generic [ref=e97]:
+            - generic [ref=e101]: selected_batch
+            - combobox "selected_batch" [ref=e102] [cursor=pointer]:
+              - option "All" [selected]
+              - option "BATCH-001"
+              - option "BATCH-002"
+              - option "BATCH-003"
+              - option "BATCH-004"
+              - option "BATCH-005"
+              - option "BATCH-006"
+              - option "BATCH-007"
+              - option "BATCH-008"
+              - option "BATCH-009"
+              - option "BATCH-010"
+              - option "BATCH-011"
+              - option "BATCH-012"
+              - option "BATCH-013"
+              - option "BATCH-014"
+              - option "BATCH-015"
+              - option "BATCH-016"
+              - option "BATCH-017"
+              - option "BATCH-018"
+              - option "BATCH-019"
+              - option "BATCH-020"
+              - option "BATCH-021"
+              - option "BATCH-022"
+              - option "BATCH-023"
+              - option "BATCH-024"
+              - option "BATCH-025"
+              - option "BATCH-026"
+              - option "BATCH-027"
+              - option "BATCH-028"
+              - option "BATCH-029"
+              - option "BATCH-030"
+              - option "BATCH-031"
+              - option "BATCH-032"
+              - option "BATCH-033"
+              - option "BATCH-034"
+              - option "BATCH-035"
+              - option "BATCH-036"
+              - option "BATCH-037"
+              - option "BATCH-038"
+              - option "BATCH-039"
+              - option "BATCH-040"
+              - option "BATCH-041"
+              - option "BATCH-042"
+              - option "BATCH-043"
+              - option "BATCH-044"
+              - option "BATCH-045"
+              - option "BATCH-046"
+              - option "BATCH-047"
+              - option "BATCH-048"
+              - option "BATCH-049"
+              - option "BATCH-050"
+              - option "BATCH-051"
+              - option "BATCH-052"
+              - option "BATCH-053"
+              - option "BATCH-054"
+              - option "BATCH-055"
+              - option "BATCH-056"
+              - option "BATCH-057"
+              - option "BATCH-058"
+              - option "BATCH-059"
+              - option "BATCH-060"
+      - button [ref=e12] [cursor=pointer]:
+        - img [ref=e13]
+      - generic [ref=e104]:
+        - generic [ref=e105] [cursor=pointer]: Industrial command center for predictive maintenance and lot genealogy
+        - generic [ref=e106] [cursor=pointer]: Decision controls
+        - generic [ref=e107] [cursor=pointer]: Containment focus
+  - region "Notifications (F8)":
+    - list
