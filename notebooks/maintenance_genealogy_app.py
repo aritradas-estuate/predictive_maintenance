@@ -17,7 +17,7 @@
 
 import marimo
 
-__generated_with = "0.23.1"
+__generated_with = "0.23.2"
 app = marimo.App(width="full")
 
 
@@ -80,6 +80,7 @@ def _(
     average_precision_score,
     go,
     make_subplots,
+    mo,
     np,
     nx,
     pd,
@@ -3379,6 +3380,7 @@ def _(
         from filterpy.kalman import KalmanFilter
         from hmmlearn.hmm import GaussianHMM
         from scipy.stats import kurtosis as scipy_kurtosis
+        import warnings
 
         n = len(asset_df)
         if n < 48:
@@ -3401,6 +3403,16 @@ def _(
 
         # Build normalized feature matrix from time-domain features
         health_signals = pd.DataFrame(index=asset_df.index)
+
+        def _safe_kurtosis(values):
+            values = np.asarray(values, dtype=float)
+            if len(values) < 4 or np.nanstd(values) < 1e-9:
+                return 3.0
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                result = scipy_kurtosis(values, fisher=False)
+            return 3.0 if not np.isfinite(result) else float(result)
+
         for col in sensor_cols:
             series = (
                 asset_df[col].astype(float).interpolate(limit_direction="both")
@@ -3425,12 +3437,7 @@ def _(
             # Kurtosis
             kurt = (
                 series.rolling(window, min_periods=4)
-                .apply(
-                    lambda x: (
-                        scipy_kurtosis(x, fisher=False) if len(x) >= 4 else 3.0
-                    ),
-                    raw=True,
-                )
+                .apply(_safe_kurtosis, raw=True)
                 .bfill()
                 .ffill()
             )
@@ -3700,9 +3707,8 @@ def _(NOTEBOOK_DATE, mo):
         }
         .pm-hero {
           padding: 1.4rem 1.6rem;
-          border-radius: 22px;
+          border-radius: 8px;
           background:
-            radial-gradient(circle at top right, rgba(207, 143, 61, 0.22), transparent 30%),
             linear-gradient(135deg, #13212b 0%, #315c72 55%, #8aa1af 100%);
           color: white;
           border: 1px solid rgba(255,255,255,0.16);
@@ -3719,7 +3725,7 @@ def _(NOTEBOOK_DATE, mo):
         .pm-panel {
           background: var(--pm-panel);
           border: 1px solid var(--pm-border);
-          border-radius: 18px;
+          border-radius: 8px;
           padding: 1rem 1.1rem;
           box-shadow: 0 14px 28px rgba(49, 92, 114, 0.06);
         }
@@ -3733,15 +3739,15 @@ def _(NOTEBOOK_DATE, mo):
         f"""
         <section class="pm-hero">
           <div style="font-size:0.86rem; letter-spacing:0.08em; text-transform:uppercase;">
-            Enterprise Traceability + Predictive Maintenance
+            Estuate Prismatic Predictive Analytics
           </div>
           <h1 style="margin:0.35rem 0 0; font-size:2rem;">
-            Operational command center for maintenance and containment
+            Industrial command center for predictive maintenance and lot genealogy
           </h1>
           <p>
-            Identify the affected lot, trace downstream exposure, separate unsold from sold units,
-            and trigger the right field action alongside maintenance decisions. Refreshed on
-            {NOTEBOOK_DATE}.
+            Detect equipment risk, optimize maintenance timing, trace affected lots and parts,
+            and convert analytical signals into containment, recall, warranty, and service actions.
+            Refreshed on {NOTEBOOK_DATE}.
           </p>
         </section>
         """
@@ -3761,20 +3767,26 @@ def _(ev_state, metro_state, mo):
         if ev_state["mode"] == "demo"
         else f"Using EV Battery QC source: {ev_state['source']}."
     )
-    mo.callout(
+    traceability_note = (
+        "- Demo mode simulates lot-to-vehicle, dealer, and sale-status mappings so the containment workflow stays reviewable before downstream system onboarding.\n"
+        "- This keeps the hold-versus-recall story visible even when real inventory and service data are not yet connected."
+        if metro_state["mode"] == "demo" or ev_state["mode"] == "demo"
+        else "- Real source files are loaded for both maintenance telemetry and EV battery quality genealogy.\n"
+        "- Traceability fields are enriched only when optional downstream inventory or service columns are missing."
+    )
+    data_readiness_note = mo.callout(
         mo.md(
             f"""
             **Data readiness**
 
             - {metro_note}
             - {ev_note}
-            - Demo mode now simulates lot-to-vehicle, dealer, and sale-status mappings so the containment workflow stays reviewable before downstream system onboarding.
-            - This keeps the hold-versus-recall story visible even when real inventory and service data are not yet connected.
+            {traceability_note}
             """
         ),
         kind="info",
     )
-    return
+    return (data_readiness_note,)
 
 
 @app.cell(hide_code=True)
@@ -3861,29 +3873,24 @@ def _(ev_state, line_picker, mo, supplier_picker):
 
 
 @app.cell
-def _(
-    analyze_ev,
-    analyze_metro,
-    asset_picker,
-    batch_picker,
-    ev_state,
-    horizon_slider,
-    line_picker,
-    metro_state,
-    supplier_picker,
-):
+def _(analyze_metro, asset_picker, horizon_slider, metro_state):
     metro_analysis = analyze_metro(
         metro_state,
         selected_asset=asset_picker.value,
         horizon_hours=horizon_slider.value,
     )
+    return (metro_analysis,)
+
+
+@app.cell
+def _(analyze_ev, batch_picker, ev_state, line_picker, supplier_picker):
     ev_analysis = analyze_ev(
         ev_state,
         selected_supplier=supplier_picker.value,
         selected_line=line_picker.value,
         selected_batch=batch_picker.value,
     )
-    return ev_analysis, metro_analysis
+    return (ev_analysis,)
 
 
 @app.cell(hide_code=True)
@@ -3892,7 +3899,7 @@ def _(ev_analysis, metro_analysis, mo):
         [
             mo.stat(
                 value=f"{metro_analysis['risk_score']:.0f}",
-                label="maintenance urgency",
+                label="Prismatic maintenance urgency",
                 caption=metro_analysis["recommendation"],
                 bordered=True,
             ),
@@ -3916,14 +3923,14 @@ def _(ev_analysis, metro_analysis, mo):
             ),
             mo.stat(
                 value=str(metro_analysis["high_priority_count"]),
-                label="priority maintenance items",
+                label="Prismatic priority queue",
                 caption=f"{metro_analysis['next_shift_count']} plan-next-shift items",
                 bordered=True,
             ),
             mo.stat(
                 value=ev_analysis["containment_summary"]["affected_lot"],
-                label="active quality lot",
-                caption="enterprise proof point",
+                label="active genealogy lot",
+                caption="traceability proof point",
                 bordered=True,
             ),
         ],
@@ -3948,12 +3955,11 @@ def _(ROOT, mo):
         Data placement details: [`data/README.md`]({ROOT / "data" / "README.md"}).
         """
     )
-    inspiration
-    return
+    return (inspiration,)
 
 
 @app.cell(hide_code=True)
-def _(ev_analysis, metro_analysis, mo, pd):
+def _(data_readiness_note, ev_analysis, inspiration, metro_analysis, mo, pd):
     maintenance_summary = mo.Html(
         f"""
         <style>
@@ -3964,7 +3970,7 @@ def _(ev_analysis, metro_analysis, mo, pd):
             margin-bottom: 0.2rem;
           }}
           .pm-maint-hero, .pm-maint-stat {{
-            border-radius: 18px;
+            border-radius: 8px;
             border: 1px solid #dbe3e8;
             background: #ffffff;
             box-shadow: 0 10px 22px rgba(49, 92, 114, 0.08);
@@ -4057,7 +4063,7 @@ def _(ev_analysis, metro_analysis, mo, pd):
             margin-bottom: 0.2rem;
           }}
           .pm-lot-hero, .pm-lot-stat {{
-            border-radius: 18px;
+            border-radius: 8px;
             border: 1px solid #dbe3e8;
             background: #ffffff;
             box-shadow: 0 10px 22px rgba(49, 92, 114, 0.08);
@@ -4159,23 +4165,183 @@ def _(ev_analysis, metro_analysis, mo, pd):
         )
     )
 
+    total_costs = metro_analysis["economics_table"].set_index("Scenario")[
+        "Total cost index"
+    ]
+    optimal_cost = int(total_costs.get("Optimal window", total_costs.min()))
+    defer_cost = int(total_costs.get("Defer beyond runway", total_costs.max()))
+    avoided_cost = max(0, defer_cost - optimal_cost)
+    top_recommendation = (
+        f"Schedule maintenance in the {metro_analysis['maintenance_window']} window and use lot genealogy to contain {ev_analysis['containment_summary']['affected_lot']}."
+    )
+
+    executive_story = mo.Html(
+        f"""
+        <style>
+          .pm-exec-grid {{
+            display: grid;
+            grid-template-columns: minmax(280px, 1.45fr) repeat(3, minmax(150px, 1fr));
+            gap: 12px;
+          }}
+          .pm-exec-hero, .pm-exec-card {{
+            border: 1px solid #dbe3e8;
+            border-radius: 8px;
+            background: #ffffff;
+            box-shadow: 0 10px 22px rgba(49, 92, 114, 0.08);
+            padding: 15px 16px;
+          }}
+          .pm-exec-hero {{
+            background: linear-gradient(135deg, #13212b 0%, #315c72 68%, #8aa1af 100%);
+            color: #ffffff;
+          }}
+          .pm-exec-eyebrow {{
+            color: rgba(255,255,255,0.78);
+            font-size: 0.78rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+          }}
+          .pm-exec-hero h3 {{
+            margin: 0.35rem 0 0.35rem;
+            font-size: 1.35rem;
+          }}
+          .pm-exec-hero p {{
+            margin: 0;
+            line-height: 1.38;
+            color: rgba(255,255,255,0.88);
+          }}
+          .pm-exec-card .label {{
+            color: #5a6b76;
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+          }}
+          .pm-exec-card .value {{
+            margin-top: 0.35rem;
+            font-size: 1.55rem;
+            font-weight: 750;
+            color: #13212b;
+          }}
+          .pm-exec-card .caption {{
+            margin-top: 0.2rem;
+            color: #5a6b76;
+            font-size: 0.92rem;
+            line-height: 1.32;
+          }}
+          .pm-industry-strip {{
+            display: grid;
+            grid-template-columns: repeat(4, minmax(150px, 1fr));
+            gap: 10px;
+          }}
+          .pm-industry-pill {{
+            border: 1px solid #dbe3e8;
+            border-radius: 8px;
+            background: #ffffff;
+            padding: 11px 12px;
+            min-height: 74px;
+          }}
+          .pm-industry-pill strong {{
+            display: block;
+            color: #13212b;
+            font-size: 0.94rem;
+          }}
+          .pm-industry-pill span {{
+            display: block;
+            margin-top: 0.22rem;
+            color: #5a6b76;
+            font-size: 0.86rem;
+            line-height: 1.25;
+          }}
+          @media (max-width: 1100px) {{
+            .pm-exec-grid, .pm-industry-strip {{
+              grid-template-columns: repeat(2, minmax(170px, 1fr));
+            }}
+          }}
+        </style>
+        <div class="pm-exec-grid">
+          <div class="pm-exec-hero">
+            <div class="pm-exec-eyebrow">Estuate Prismatic executive signal</div>
+            <h3>{top_recommendation}</h3>
+            <p>One workflow connects asset health, maintenance economics, lot genealogy, and field action readiness.</p>
+          </div>
+          <div class="pm-exec-card">
+            <div class="label">Maintenance action</div>
+            <div class="value">{metro_analysis["recommendation"]}</div>
+            <div class="caption">Window: {metro_analysis["maintenance_window"]}; RUL: {metro_analysis["rul_info"]["composite_rul_hours"]}h.</div>
+          </div>
+          <div class="pm-exec-card">
+            <div class="label">Economic case</div>
+            <div class="value">{avoided_cost}</div>
+            <div class="caption">Relative cost index avoided versus deferring beyond runway.</div>
+          </div>
+          <div class="pm-exec-card">
+            <div class="label">Traceability action</div>
+            <div class="value">{ev_analysis["containment_summary"]["impacted_vehicle_count"]}</div>
+            <div class="caption">Downstream units traced across hold and recall readiness.</div>
+          </div>
+        </div>
+        """
+    )
+
+    industry_strip = mo.Html(
+        """
+        <div class="pm-industry-strip">
+          <div class="pm-industry-pill"><strong>Pharma and biopharma</strong><span>Lot genealogy for traceability, recall, and compliance.</span></div>
+          <div class="pm-industry-pill"><strong>Medical devices</strong><span>Component lineage for safety investigation and recall readiness.</span></div>
+          <div class="pm-industry-pill"><strong>Food and beverage</strong><span>Ingredient traceability and fast containment response.</span></div>
+          <div class="pm-industry-pill"><strong>Chemicals</strong><span>Raw material, intermediate, and quality outcome tracking.</span></div>
+          <div class="pm-industry-pill"><strong>Biotech and life sciences</strong><span>Material provenance across lab and process workflows.</span></div>
+          <div class="pm-industry-pill"><strong>CPG manufacturing</strong><span>Batch control and supply-chain visibility across products.</span></div>
+          <div class="pm-industry-pill"><strong>Industrial manufacturers</strong><span>Part traceability and warranty optimization.</span></div>
+          <div class="pm-industry-pill"><strong>Field service</strong><span>Maintenance timing connected to service and containment execution.</span></div>
+        </div>
+        """
+    )
+
+    recommendation_board = pd.DataFrame(
+        [
+            {
+                "When": "Now",
+                "Owner": "Maintenance planner",
+                "Trigger / evidence": f"{metro_analysis['risk_score']:.0f}/100 urgency; {metro_analysis['incident_card']['title']} is the weakest signal",
+                "Estuate Prismatic action": f"Schedule intervention in {metro_analysis['maintenance_window']}",
+                "Business impact": "Avoid unplanned downtime while preserving useful production runway",
+            },
+            {
+                "When": "Now",
+                "Owner": "Quality and containment",
+                "Trigger / evidence": f"{ev_analysis['containment_summary']['affected_lot']} traced to {ev_analysis['containment_summary']['supplier']}",
+                "Estuate Prismatic action": "Place dealer holds and prepare recall inspection queue",
+                "Business impact": "Convert genealogy into targeted field action instead of broad containment",
+            },
+            {
+                "When": "Next shift",
+                "Owner": "Operations lead",
+                "Trigger / evidence": f"{metro_analysis['high_priority_count']} immediate and {metro_analysis['next_shift_count']} next-shift maintenance items",
+                "Estuate Prismatic action": "Triage the ranked portfolio backlog before shift handoff",
+                "Business impact": "Align maintenance labor to the highest-risk assets first",
+            },
+            {
+                "When": "Enterprise extension",
+                "Owner": "Manufacturing analytics",
+                "Trigger / evidence": "Predictive quality, SPC, and genealogy views share the same data foundation",
+                "Estuate Prismatic action": "Extend from asset health to process health and downstream traceability",
+                "Business impact": "Reuse the platform across regulated and industrial traceability workflows",
+            },
+        ]
+    )
+
     executive_view = mo.vstack(
         [
-            mo.md(
-                f"""
-                ### Executive overview
-
-                - **Predictive maintenance posture:** {metro_analysis["recommendation"]} for the selected asset, with an action window of **{metro_analysis["maintenance_window"]}**.
-                - **Health state estimation:** Kalman-filtered health index with HMM classification puts the asset in a **{metro_analysis["health_states"]["current_state"]}** state ({metro_analysis["health_states"]["state_pct"]["Critical"]:.0f}% of history in Critical).
-                - **Early warning:** the system is surfacing a **{metro_analysis["warning_profile"]["state"]}** signal with **{metro_analysis["warning_profile"]["warning_horizon_hours"]}h** of warning lead time.
-                - **Failure progression:** the current issue is being driven first by **{metro_analysis["incident_card"]["title"]}**, then by the next-ranked precursor signals in the failure ladder.
-                - **Portfolio view:** the notebook now prioritizes a maintenance backlog, not just one machine. Immediate-action items: **{metro_analysis["high_priority_count"]}**.
-                - **Enterprise proof:** the same stack also drives downstream traceability and containment through lot genealogy when a process-quality issue is detected.
-                """
-            ),
+            mo.md("### Executive overview"),
+            executive_story,
             maintenance_summary,
+            panel("Industrial fit", industry_strip),
             panel(
-                "Maintenance actions",
+                "Estuate Prismatic recommended actions",
+                mo.ui.table(recommendation_board, selection=None, page_size=4),
+            ),
+            panel(
+                "Maintenance decision",
                 mo.ui.table(
                     metro_analysis["action_table"], selection=None, page_size=4
                 ),
@@ -4255,7 +4421,33 @@ def _(ev_analysis, metro_analysis, mo, pd):
                 f"""
                 ### Maintenance economics
 
-                The economics layer is deliberately heuristic. It translates the intervention timing recommendation into a directional business tradeoff between planned downtime, failure exposure, and avoidable disruption.
+                Estuate Prismatic translates the maintenance recommendation into the business tradeoff an operations leader needs: act too early, act in the optimized window, or defer beyond the risk runway.
+                """
+            ),
+            mo.Html(
+                f"""
+                <div class="pm-exec-grid">
+                  <div class="pm-exec-hero">
+                    <div class="pm-exec-eyebrow">Why act in the recommended window</div>
+                    <h3>Optimal window reduces the relative cost index by {avoided_cost} versus deferring beyond runway.</h3>
+                    <p>The model balances planned downtime against rising failure exposure and avoidable disruption.</p>
+                  </div>
+                  <div class="pm-exec-card">
+                    <div class="label">Optimal timing</div>
+                    <div class="value">{metro_analysis["schedule"]["optimal_hour"]}h</div>
+                    <div class="caption">Recommended maintenance point inside the selected horizon.</div>
+                  </div>
+                  <div class="pm-exec-card">
+                    <div class="label">Failure risk</div>
+                    <div class="value">{metro_analysis["schedule"]["failure_at_optimal"]:.0%}</div>
+                    <div class="caption">Estimated exposure at the optimized maintenance point.</div>
+                  </div>
+                  <div class="pm-exec-card">
+                    <div class="label">Business posture</div>
+                    <div class="value">{metro_analysis["recommendation"]}</div>
+                    <div class="caption">Current urgency: {metro_analysis["risk_score"]:.0f}/100.</div>
+                  </div>
+                </div>
                 """
             ),
             mo.hstack(
@@ -4400,17 +4592,22 @@ def _(ev_analysis, metro_analysis, mo, pd):
         gap=1.0,
     )
 
-    recommendations = mo.md(
-        f"""
-        ### Operational recommendations
+    recommendations = mo.vstack(
+        [
+            mo.md(
+                """
+                ### Estuate Prismatic recommended actions
 
-        1. **Maintenance timing:** schedule maintenance at **{metro_analysis["schedule"]["optimal_hour"]}h** (window: {metro_analysis["maintenance_window"]}). Current urgency is **{metro_analysis["risk_score"]:.0f}/100**.
-        2. **Health state estimation:** the Kalman filter + HMM pipeline classifies the asset as **{metro_analysis["health_states"]["current_state"]}** ({metro_analysis["health_states"]["state_pct"]["Critical"]:.0f}% of history in Critical). Use this alongside the risk score for richer maintenance decisions.
-        3. **Early warning:** communicate that the system surfaces a **{metro_analysis["warning_profile"]["state"]}** signal with **{metro_analysis["warning_profile"]["warning_horizon_hours"]}h** of advance warning before the machine enters the intervention boundary.
-        4. **Portfolio triage:** prioritize **{metro_analysis["high_priority_count"]}** immediate maintenance items first, then **{metro_analysis["next_shift_count"]}** plan-next-shift items from the backlog board.
-        5. **Failure explanation:** explain the maintenance issue through the top precursor chain, starting with **{metro_analysis["incident_card"]["title"]}** and the driver ladder in the failure-progression tab.
-        6. **Enterprise extension:** use the lot genealogy and predictive-quality tabs to show that the same stack can move from machine health to process health to downstream containment actions.
-        """
+                The recommendation layer turns the analytics into owners, triggers, actions, and business impact.
+                """
+            ),
+            mo.ui.table(recommendation_board, selection=None, page_size=6),
+            panel(
+                "Supporting notes",
+                mo.vstack([data_readiness_note, inspiration], gap=0.8),
+            ),
+        ],
+        gap=1.0,
     )
 
     health_state_view = mo.vstack(
@@ -4477,12 +4674,12 @@ def _(ev_analysis, metro_analysis, mo, pd):
     app_tabs = mo.ui.tabs(
         {
             "Executive overview": executive_view,
-            "Fleet maintenance": fleet_view,
-            "Failure progression": failure_view,
-            "Health state estimation": health_state_view,
             "Maintenance economics": maintenance_econ_view,
+            "Fleet maintenance": fleet_view,
             "Lot genealogy": genealogy_view,
+            "Failure progression": failure_view,
             "Predictive quality": predictive_quality_view,
+            "Health state estimation": health_state_view,
             "Recommendations": recommendations,
         },
         value="Executive overview",
